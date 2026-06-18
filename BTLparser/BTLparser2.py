@@ -27,7 +27,7 @@ MAPPING_PATH  (overwritten in place with ProcessesFile filled in)
   Header + same rows, ProcessesFile column updated.
 
 Process row format:
-  ID, NoOfProcesses, ProcessKey, P1..P14, P15, Type
+  ID, NoOfProcesses, ProcessKey, P1..P15, P15, Type
 
   P1-P14  : numeric, divided by 100
   P15     : string (quotes stripped)
@@ -74,12 +74,35 @@ CUT_PROCESS_KEYS = {
 # Mapping CSV
 # ---------------------------------------------------------------------------
 
+def detect_text_encoding(path):
+    """
+    Detect whether a text file is UTF-8 (with or without BOM) or a
+    Windows ANSI codepage (cp1252, used by Finnish Windows for ä, ö, å).
+
+    Returns one of: "utf-8-sig", "utf-8", "cp1252".
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        # Not valid UTF-8 — most likely Windows-1252 (Finnish ä/ö/å etc.)
+        return "cp1252"
+
+
 def load_mapping(csv_path):
     """
-    Parse the mapping CSV. Returns (rows, manual_mode).
+    Parse the mapping CSV. Returns (rows, manual_mode, encoding, delimiter).
 
     rows        : list of dicts — element, project, building, file_num
     manual_mode : True when every row has empty ProjectID and BuildingID
+    encoding    : detected text encoding string to use when rewriting
+    delimiter   : detected CSV delimiter (',' or ';')
 
     Raises FileNotFoundError, ValueError, or OSError on failure.
     """
@@ -88,11 +111,13 @@ def load_mapping(csv_path):
     if os.path.getsize(csv_path) == 0:
         raise ValueError("Mapping file is empty: {}".format(csv_path))
 
-    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+    encoding = detect_text_encoding(csv_path)
+
+    with open(csv_path, "r", encoding=encoding, errors="strict") as f:
         sample = f.read(1024)
     delimiter = ";" if sample.count(";") >= sample.count(",") else ","
 
-    with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+    with open(csv_path, "r", encoding=encoding, errors="strict", newline="") as f:
         reader = csv.DictReader(f, delimiter=delimiter)
 
         if reader.fieldnames is None:
@@ -135,18 +160,26 @@ def load_mapping(csv_path):
         raise ValueError("Mapping file contains no valid data rows.")
 
     manual_mode = all(not r["project"] and not r["building"] for r in rows)
-    return rows, manual_mode
+    return rows, manual_mode, encoding, delimiter
 
 
-def write_mapping(csv_path, rows):
-    """Overwrite mapping with ProcessesFile column filled in."""
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        f.write(MAPPING_HEADER)
+def write_mapping(csv_path, rows, encoding="utf-8-sig", delimiter=","):
+    """
+    Overwrite mapping with ProcessesFile column filled in.
+    Writes using the provided encoding and delimiter to preserve the original
+    file's character encoding and CSV style (important for Finnish characters).
+
+    encoding: should be one of the values returned by detect_text_encoding()
+    delimiter: usually ',' or ';'
+    """
+    # Recreate header using the chosen delimiter to match original format.
+    header = delimiter.join(["Element", "ProjectID", "BuildingID", "ProcessesFile"])
+    with open(csv_path, "w", encoding=encoding, newline="") as f:
+        f.write(header)
         f.write("\r\n")
         for r in rows:
-            f.write("{},{},{},{}".format(
-                r["element"], r["project"], r["building"], r["file_num"]
-            ))
+            # Join fields using delimiter and ensure no extra spaces are added
+            f.write(delimiter.join([r["element"], r["project"], r["building"], str(r["file_num"])]))
             f.write("\r\n")
 
 
@@ -264,8 +297,16 @@ def parse_btl_processes(btl_path):
     if os.path.getsize(btl_path) == 0:
         raise ValueError("BTL file is empty: {}".format(btl_path))
 
-    with open(btl_path, "r", encoding="windows-1252", errors="replace") as f:
-        raw_lines = f.readlines()
+    # BTL files are saved as UTF-8 (utf-8-sig tolerates an optional BOM).
+    # Fall back to windows-1252 only if the file turns out not to be valid
+    # UTF-8 — this avoids silently mangling Finnish characters (ä, ö, å)
+    # the way decoding UTF-8 bytes as windows-1252 would.
+    try:
+        with open(btl_path, "r", encoding="utf-8-sig", errors="strict") as f:
+            raw_lines = f.readlines()
+    except UnicodeDecodeError:
+        with open(btl_path, "r", encoding="windows-1252", errors="replace") as f:
+            raw_lines = f.readlines()
 
     parts       = []
     current     = None
@@ -322,8 +363,8 @@ def parse_btl_processes(btl_path):
 # Output writer
 # ---------------------------------------------------------------------------
 
-def write_process_file(path, btl_path, rows):
-    with open(path, "w", encoding="utf-8", newline="") as f:
+def write_process_file(path, btl_path, rows, encoding="utf-8"):
+    with open(path, "w", encoding=encoding, newline="") as f:
         f.write(btl_path)
         f.write("\r\n")
         f.write(PROCESS_HEADER)
@@ -331,6 +372,31 @@ def write_process_file(path, btl_path, rows):
         for row in rows:
             f.write(",".join(row))
             f.write("\r\n")
+
+
+def write_error_file(output_dir, messages, encoding="utf-8-sig"):
+    """
+    Overwrite OUTPUT_DIR/error.txt. Format:
+      - If messages is empty: first line "0"
+      - Otherwise: first line = number of errors, then each error on a new line.
+    Uses utf-8-sig by default so Notepad shows Finnish characters correctly.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        err_path = os.path.join(output_dir, "error.txt")
+        with open(err_path, "w", encoding=encoding, newline="") as ef:
+            if not messages:
+                ef.write("0")
+                ef.write("\r\n")
+            else:
+                ef.write(str(len(messages)))
+                ef.write("\r\n")
+                for m in messages:
+                    ef.write(m)
+                    ef.write("\r\n")
+    except OSError:
+        # If even writing the error file fails, nothing we can do here.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -359,30 +425,41 @@ def main(argv):
 
     manual_btl_path = argv[1] if len(argv) == 2 else None
 
+    # Collect non-fatal error messages to write into error.txt at the end.
+    errors = []
+
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
     except OSError as e:
-        print("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e),
-              file=sys.stderr)
+        msg = "ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e)
+        print(msg, file=sys.stderr)
+        # Try to write error file (will attempt to create the dir); fallback encoding
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
 
     # --- Load mapping -------------------------------------------------------
     try:
-        rows, manual_mode = load_mapping(MAPPING_PATH)
+        rows, manual_mode, mapping_encoding, mapping_delimiter = load_mapping(MAPPING_PATH)
     except FileNotFoundError as e:
-        print("ERROR: {}".format(e), file=sys.stderr)
+        msg = "ERROR: {}".format(e)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 2
     except (OSError, ValueError) as e:
-        print("ERROR: {}".format(e), file=sys.stderr)
+        msg = "ERROR: {}".format(e)
+        print(msg, file=sys.stderr)
+        # If mapping exists but couldn't be parsed, write error file
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
 
     # Validate argument consistency
     if manual_mode and manual_btl_path is None:
-        print(
+        msg = (
             "ERROR: Mapping has empty ProjectID/BuildingID (manual mode) "
-            "but no BTL path was provided as argument.",
-            file=sys.stderr,
+            "but no BTL path was provided as argument."
         )
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 2
 
     if not manual_mode and manual_btl_path is not None:
@@ -410,20 +487,27 @@ def main(argv):
 
     # --- Delete stale Processes<N>.txt files from previous runs -------------
     needed = {file_num for file_num, _ in pairs}
-    for fname in os.listdir(OUTPUT_DIR):
-        if not fname.startswith("Processes") or not fname.endswith(".txt"):
-            continue
-        stem = fname[len("Processes"):-len(".txt")]
-        try:
-            existing_num = int(stem)
-        except ValueError:
-            continue
-        if existing_num not in needed:
+    try:
+        for fname in os.listdir(OUTPUT_DIR):
+            if not fname.startswith("Processes") or not fname.endswith(".txt"):
+                continue
+            stem = fname[len("Processes"):-len(".txt")]
             try:
-                os.remove(os.path.join(OUTPUT_DIR, fname))
-                print("Deleted stale: {}".format(fname))
-            except OSError as e:
-                print("WARNING: Could not delete '{}': {}".format(fname, e), file=sys.stderr)
+                existing_num = int(stem)
+            except ValueError:
+                continue
+            if existing_num not in needed:
+                try:
+                    os.remove(os.path.join(OUTPUT_DIR, fname))
+                    print("Deleted stale: {}".format(fname))
+                except OSError as e:
+                    warn = "WARNING: Could not delete '{}': {}".format(fname, e)
+                    print(warn, file=sys.stderr)
+                    errors.append(warn)
+    except OSError as e:
+        warn = "WARNING: Could not list output directory '{}': {}".format(OUTPUT_DIR, e)
+        print(warn, file=sys.stderr)
+        errors.append(warn)
 
     # --- Parse each BTL and write Processes<N>.txt --------------------------
     files_written  = 0
@@ -437,40 +521,54 @@ def main(argv):
             process_rows = parse_btl_processes(btl_path)
             print("Parsed '{}': {} process row(s).".format(btl_path, len(process_rows)))
         except FileNotFoundError as e:
-            print("ERROR: {}".format(e), file=sys.stderr)
+            msg = "ERROR: {}".format(e)
+            print(msg, file=sys.stderr)
             failed_paths.append(btl_path)
+            errors.append(msg)
             process_rows = []
         except (OSError, ValueError) as e:
-            print("ERROR: {}".format(e), file=sys.stderr)
+            msg = "ERROR: {}".format(e)
+            print(msg, file=sys.stderr)
+            errors.append(msg)
             process_rows = []
 
         try:
-            write_process_file(out_path, btl_path, process_rows)
+            # Write Processes file using mapping encoding to preserve Finnish chars in mapping-related text
+            write_process_file(out_path, btl_path, process_rows, encoding=mapping_encoding or "utf-8")
             files_written += 1
             total_rows    += len(process_rows)
         except OSError as e:
-            print("ERROR: Could not write '{}': {}".format(out_path, e), file=sys.stderr)
+            msg = "ERROR: Could not write '{}': {}".format(out_path, e)
+            print(msg, file=sys.stderr)
+            errors.append(msg)
 
-    # --- Write errors.txt ---------------------------------------------------
+    # --- Write status.txt ---------------------------------------------------
     # Always written; first line = number of BTL path errors, then one path
     # per line. Zero errors produces a single line containing "0".
-    status_path = os.path.join(OUTPUT_DIR, "errors.txt")
+    status_path = os.path.join(OUTPUT_DIR, "status.txt")
     try:
-        with open(status_path, "w", encoding="utf-8", newline="") as sf:
+        with open(status_path, "w", encoding=mapping_encoding or "utf-8", newline="") as sf:
             sf.write(str(len(failed_paths)))
             sf.write("\r\n")
             for fp in failed_paths:
                 sf.write(fp)
                 sf.write("\r\n")
     except OSError as e:
-        print("ERROR: Could not write errors.txt: {}".format(e), file=sys.stderr)
+        msg = "ERROR: Could not write status.txt: {}".format(e)
+        print(msg, file=sys.stderr)
+        errors.append(msg)
 
     # --- Update mapping -----------------------------------------------------
     try:
-        write_mapping(MAPPING_PATH, rows)
+        write_mapping(MAPPING_PATH, rows, encoding=mapping_encoding, delimiter=mapping_delimiter)
         print("Mapping updated: {} ({} element(s)).".format(MAPPING_PATH, len(rows)))
     except OSError as e:
-        print("ERROR: Could not update mapping file: {}".format(e), file=sys.stderr)
+        msg = "ERROR: Could not update mapping file: {}".format(e)
+        print(msg, file=sys.stderr)
+        errors.append(msg)
+
+    # Always overwrite error.txt: no errors => write "0", else write collected messages.
+    write_error_file(OUTPUT_DIR, errors)
 
     print("Done: {} Processes file(s), {} total process row(s).".format(
         files_written, total_rows))

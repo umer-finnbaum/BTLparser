@@ -89,6 +89,32 @@ CUT_PROCESS_KEYS = {
 # Header written as line 2 of every output file (line 1 is the part count).
 FILE_HEADER = "PartNum,ID,MaterialType,Length,Heigth,Width,ModuleNum,Timbergrade,ElemName,Type"
 
+
+# ---------------------------------------------------------------------------
+# Encoding detection (keep Finnish characters correct)
+# ---------------------------------------------------------------------------
+
+def detect_text_encoding(path):
+    """
+    Detect whether a text file is UTF-8 (with or without BOM) or a
+    Windows ANSI codepage (cp1252, used by Finnish Windows for ä, ö, å).
+
+    Returns one of: "utf-8-sig", "utf-8", "cp1252".
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        # Not valid UTF-8 — most likely Windows-1252 (Finnish ä/ö/å etc.)
+        return "cp1252"
+
+
 # ---------------------------------------------------------------------------
 # Material stock lookup
 # ---------------------------------------------------------------------------
@@ -97,10 +123,27 @@ def load_material_stock(path):
     """
     Parse fb_MAT_STOCK.txt and return {name_upper: material_number_str}.
     File is semicolon-delimited with header: Material;Name;Width;Height;Length
+
+    This now attempts to detect the file encoding to preserve Finnish characters.
     """
     lookup = {}
+    if not os.path.exists(path):
+        # Preserve previous behavior: warn and continue with empty lookup
+        print(
+            "WARNING: Material stock file not found: '{}'. "
+            "All materials will be reported as 100.".format(path),
+            file=sys.stderr,
+        )
+        return lookup
+
+    # Detect encoding and open accordingly. Use replace for robustness.
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        encoding = detect_text_encoding(path)
+    except Exception:
+        encoding = "utf-8"
+
+    try:
+        with open(path, "r", encoding=encoding, errors="replace") as f:
             for i, line in enumerate(f):
                 line = line.strip()
                 if not line or i == 0:      # skip empty lines and header
@@ -110,10 +153,11 @@ def load_material_stock(path):
                     mat_num  = parts[0].strip()
                     mat_name = parts[1].strip()
                     lookup[mat_name.upper()] = mat_num
-    except FileNotFoundError:
+    except Exception as e:
+        # If something unexpected goes wrong, warn and continue (same overall behavior).
         print(
-            "WARNING: Material stock file not found: '{}'. "
-            "All materials will be reported as 100.".format(path),
+            "WARNING: Failed to read material stock '{}': {}. "
+            "All materials will be reported as 100.".format(path, e),
             file=sys.stderr,
         )
     return lookup
@@ -259,7 +303,7 @@ def classify_bucket(package_value, module_seen):
 # Main parser
 # ---------------------------------------------------------------------------
 
-def parse_btl(input_path, mat_lookup):
+def parse_btl(input_path, mat_lookup, encoding=None):
     """
     Parse the BTL file.
 
@@ -267,6 +311,10 @@ def parse_btl(input_path, mat_lookup):
       numbered_buckets : {bucket_int: [row_str, ...]}
       bucket0_rows     : [row_str, ...]
     """
+    # Determine encoding to use for reading; if not provided, detect it.
+    if encoding is None:
+        encoding = detect_text_encoding(input_path)
+
     numbered_buckets = {b: [] for b in NUMBERED_BUCKETS}
     numbered_elems   = {b: [] for b in NUMBERED_BUCKETS}  # parallel: designations only
     bucket0_rows = []
@@ -303,68 +351,76 @@ def parse_btl(input_path, mat_lookup):
             bucket0_rows.append(make_bucket0_row(part))
             bucket0_elems.append(desig)
 
-    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
-        for raw_line in f:
-            line   = raw_line.strip()
-            tokens = line.split() if line else []
-            if not tokens:
-                continue
-            key = tokens[0]
+    # Try reading with the detected encoding; if strict UTF-8 fails, fall back to cp1252
+    try:
+        with open(input_path, "r", encoding=encoding, errors="strict") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        # If the detected encoding was utf-8 or utf-8-sig, fall back to cp1252 with replace
+        with open(input_path, "r", encoding="cp1252", errors="replace") as f:
+            lines = f.readlines()
 
-            # ----------------------------------------------------------------
-            if key == "[PART]":
-                flush(current)
-                current     = new_part()
-                process_cut = False
-                continue
+    for raw_line in lines:
+        line   = raw_line.strip()
+        tokens = line.split() if line else []
+        if not tokens:
+            continue
+        key = tokens[0]
 
-            if current is None:
-                continue   # lines before the first [PART]
+        # ----------------------------------------------------------------
+        if key == "[PART]":
+            flush(current)
+            current     = new_part()
+            process_cut = False
+            continue
 
-            # ----------------------------------------------------------------
-            if key == "SINGLEMEMBERNUMBER:" and len(tokens) > 1:
-                current["single_member"] = tokens[1]
+        if current is None:
+            continue   # lines before the first [PART]
 
-            elif key == "MATERIAL:" and len(tokens) > 1:
-                raw_name = strip_quotes(" ".join(tokens[1:]))
-                current["material_num"] = get_material_number(raw_name, mat_lookup)
+        # ----------------------------------------------------------------
+        if key == "SINGLEMEMBERNUMBER:" and len(tokens) > 1:
+            current["single_member"] = tokens[1]
 
-            elif key == "MODULENUMBER:" and len(tokens) > 1:
-                raw = strip_quotes(tokens[1])
-                # VBScript: SplitBTL2 = Split(Dfield(9), "-") : Dfield(9) = SplitBTL2(1)
-                parts_split = raw.split("-")
-                current["module_num"]  = parts_split[1] if len(parts_split) >= 2 else raw
-                current["module_seen"] = True
+        elif key == "MATERIAL:" and len(tokens) > 1:
+            raw_name = strip_quotes(" ".join(tokens[1:]))
+            current["material_num"] = get_material_number(raw_name, mat_lookup)
 
-            elif key == "PACKAGE:" and len(tokens) > 1:
-                current["package"] = strip_quotes(tokens[1])
+        elif key == "MODULENUMBER:" and len(tokens) > 1:
+            raw = strip_quotes(tokens[1])
+            # VBScript: SplitBTL2 = Split(Dfield(9), "-") : Dfield(9) = SplitBTL2(1)
+            parts_split = raw.split("-")
+            current["module_num"]  = parts_split[1] if len(parts_split) >= 2 else raw
+            current["module_seen"] = True
 
-            elif key == "ANNOTATION:" and len(tokens) > 1:
-                val = strip_quotes(tokens[1])
-                current["part_num"] = val if val else "0"
+        elif key == "PACKAGE:" and len(tokens) > 1:
+            current["package"] = strip_quotes(tokens[1])
 
-            elif key == "DESIGNATION:" and len(tokens) > 1:
-                current["designation"] = strip_quotes(tokens[1])
+        elif key == "ANNOTATION:" and len(tokens) > 1:
+            val = strip_quotes(tokens[1])
+            current["part_num"] = val if val else "0"
 
-            elif key == "LENGTH:" and len(tokens) > 1:
-                current["length"] = scale_dimension(tokens[1])
+        elif key == "DESIGNATION:" and len(tokens) > 1:
+            current["designation"] = strip_quotes(tokens[1])
 
-            elif key == "HEIGHT:" and len(tokens) > 1:
-                current["height"] = scale_dimension(tokens[1])
+        elif key == "LENGTH:" and len(tokens) > 1:
+            current["length"] = scale_dimension(tokens[1])
 
-            elif key == "WIDTH:" and len(tokens) > 1:
-                current["width"] = scale_dimension(tokens[1])
+        elif key == "HEIGHT:" and len(tokens) > 1:
+            current["height"] = scale_dimension(tokens[1])
 
-            elif key == "TIMBERGRADE:" and len(tokens) > 1:
-                val = strip_quotes(tokens[1])
-                current["timber_grade"] = val if val else "0"
+        elif key == "WIDTH:" and len(tokens) > 1:
+            current["width"] = scale_dimension(tokens[1])
 
-            elif key == "PROCESSKEY:" and len(tokens) > 1:
-                process_cut = tokens[1] in CUT_PROCESS_KEYS
+        elif key == "TIMBERGRADE:" and len(tokens) > 1:
+            val = strip_quotes(tokens[1])
+            current["timber_grade"] = val if val else "0"
 
-            elif key == "PROCESSPARAMETERS:" and process_cut and len(tokens) > 1:
-                a1, a2 = parse_process_params(tokens[1:])
-                update_cut_type(current, a1, a2)
+        elif key == "PROCESSKEY:" and len(tokens) > 1:
+            process_cut = tokens[1] in CUT_PROCESS_KEYS
+
+        elif key == "PROCESSPARAMETERS:" and process_cut and len(tokens) > 1:
+            a1, a2 = parse_process_params(tokens[1:])
+            update_cut_type(current, a1, a2)
 
     # Flush the final part (no trailing [PART] to trigger it inside the loop).
     flush(current)
@@ -376,13 +432,38 @@ def parse_btl(input_path, mat_lookup):
 # Output writer
 # ---------------------------------------------------------------------------
 
-def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems, output_dir):
-    """Write all output files with Windows CRLF line endings."""
+def write_error_file(output_dir, messages, encoding="utf-8-sig"):
+    """
+    Write (overwrite) an error.txt file to the output directory containing messages.
+    If messages is empty, write a single line "0". Otherwise the first line is
+    the number of errors and each subsequent line is one error message.
+    Uses utf-8-sig by default so Notepad shows Finnish characters correctly.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        err_path = os.path.join(output_dir, "error.txt")
+        with open(err_path, "w", encoding=encoding, newline="") as ef:
+            if not messages:
+                ef.write("0")
+                ef.write("\r\n")
+            else:
+                ef.write(str(len(messages)))
+                ef.write("\r\n")
+                for m in messages:
+                    ef.write(m)
+                    ef.write("\r\n")
+    except OSError:
+        # If even writing the error file fails, there's nothing we can do here.
+        pass
+
+
+def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems, output_dir, encoding="utf-8"):
+    """Write all output files with Windows CRLF line endings using the given encoding."""
     os.makedirs(output_dir, exist_ok=True)
 
     def write_file(path, rows, header=True):
         """Write count, optional header, then one row per line."""
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        with open(path, "w", encoding=encoding, newline="") as f:
             f.write(str(len(rows)))
             f.write("\r\n")
             if header:
@@ -396,8 +477,12 @@ def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems,
     for bucket in NUMBERED_BUCKETS:
         rows  = numbered_buckets.get(bucket, [])
         elems = numbered_elems.get(bucket, [])
-        write_file(os.path.join(output_dir, "FileARR{}.txt".format(bucket)), rows)
-        write_file(os.path.join(output_dir, "ElemFileARR{}.txt".format(bucket)), elems, header=False)
+        try:
+            write_file(os.path.join(output_dir, "FileARR{}.txt".format(bucket)), rows)
+            write_file(os.path.join(output_dir, "ElemFileARR{}.txt".format(bucket)), elems, header=False)
+        except OSError as e:
+            # Bubble the exception up to caller for consistent handling
+            raise
 
     # Bucket 0 — FileARR and ElemFileARR (unclassified parts)
     write_file(os.path.join(output_dir, "FileARR.txt"),     bucket0_rows)
@@ -422,55 +507,86 @@ def main(argv):
 
     # --- Input validation ---------------------------------------------------
     if not os.path.exists(input_path):
-        print("ERROR: BTL file not found: {}".format(input_path), file=sys.stderr)
+        msg = "ERROR: BTL file not found: {}".format(input_path)
+        print(msg, file=sys.stderr)
+        # write an error file too (use default encoding)
+        write_error_file(OUTPUT_DIR, [msg])
         return 2
 
     if not os.path.isfile(input_path):
-        print("ERROR: Path is not a file: {}".format(input_path), file=sys.stderr)
+        msg = "ERROR: Path is not a file: {}".format(input_path)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 2
 
     if os.path.getsize(input_path) == 0:
-        print("ERROR: BTL file is empty: {}".format(input_path), file=sys.stderr)
+        msg = "ERROR: BTL file is empty: {}".format(input_path)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
 
     # --- Output directory ---------------------------------------------------
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
     except OSError as e:
-        print("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e), file=sys.stderr)
+        msg = "ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
 
     # --- Material stock -----------------------------------------------------
+    # Now detect MAT_STOCK encoding and use it when reading so Finnish chars survive.
     mat_lookup = load_material_stock(MAT_STOCK_PATH)
     # load_material_stock already warns if the file is missing; parsing continues
     # with all materials defaulting to 100.
 
+    # --- Detect input encoding so we can preserve Finnish characters in outputs
+    try:
+        btl_encoding = detect_text_encoding(input_path)
+    except Exception:
+        btl_encoding = "utf-8"  # safe default
+
     # --- Parse --------------------------------------------------------------
     try:
-        numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems = parse_btl(input_path, mat_lookup)
+        numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems = parse_btl(input_path, mat_lookup, encoding=btl_encoding)
     except UnicodeDecodeError as e:
-        print("ERROR: Could not read BTL file (encoding problem): {}".format(e), file=sys.stderr)
+        msg = "ERROR: Could not read BTL file (encoding problem): {}".format(e)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
     except OSError as e:
-        print("ERROR: Failed to read BTL file: {}".format(e), file=sys.stderr)
+        msg = "ERROR: Failed to read BTL file: {}".format(e)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
     except Exception as e:
-        print("ERROR: Unexpected error while parsing BTL: {}".format(e), file=sys.stderr)
+        msg = "ERROR: Unexpected error while parsing BTL: {}".format(e)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
 
     total_numbered = sum(len(v) for v in numbered_buckets.values())
     total_b0       = len(bucket0_rows)
 
     if total_numbered + total_b0 == 0:
-        print("WARNING: No [PART] entries found in '{}'.".format(input_path), file=sys.stderr)
+        msg = "WARNING: No [PART] entries found in '{}'.".format(input_path)
+        print(msg, file=sys.stderr)
+        # This is considered a warning/empty result — preserve that in error.txt
+        write_error_file(OUTPUT_DIR, [msg])
         return 0  # Treated as empty/failure by CX Supervisor
 
     # --- Write outputs ------------------------------------------------------
     try:
-        write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems, OUTPUT_DIR)
+        write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems, OUTPUT_DIR, encoding=btl_encoding)
     except OSError as e:
-        print("ERROR: Failed to write output files: {}".format(e), file=sys.stderr)
+        msg = "ERROR: Failed to write output files: {}".format(e)
+        print(msg, file=sys.stderr)
+        write_error_file(OUTPUT_DIR, [msg])
         return 0
+
+    # --- Clear previous error file (no errors) -------------------------------
+    # Overwrite error.txt with "0" to indicate no errors — avoids stale old content.
+    write_error_file(OUTPUT_DIR, [])
 
     # --- Summary ------------------------------------------------------------
     print("Parsed {} parts total ({} classified, {} unclassified).".format(
