@@ -52,6 +52,15 @@ The MATERIAL name from the BTL is matched (case-insensitive) against the Name
 column of fb_MAT_STOCK.txt (semicolon-delimited). Returns the material number
 or "100" if not found. Path is hardcoded to MAT_STOCK_PATH below.
 
+MATERIAL OVERRIDE
+------------------
+After the material number is resolved, it is checked against MAT_SETTINGS.txt
+(path hardcoded to MAT_SETTINGS_PATH). Each line couples two materials that
+are the same stock at different lengths:
+  <main>,<overridden>
+Example: "6,7" means every part resolved to material 7 is reassigned to
+material 6 in the output FileARR rows. Missing settings file -> no overrides.
+
 Usage
 -----
   python btl_parser.py <input.btl>
@@ -65,6 +74,7 @@ import sys
 # ---------------------------------------------------------------------------
 
 MAT_STOCK_PATH = r"C:\FBtemp\356\Configuration\fb_MAT_STOCK.txt"
+MAT_SETTINGS_PATH = r"C:\FBtemp\356\Configuration\MAT_SETTINGS.txt"
 OUTPUT_DIR     = r"C:\FBtemp\356\BTL"
 
 PACKAGE_TO_BUCKET = {
@@ -166,6 +176,69 @@ def load_material_stock(path):
 def get_material_number(name, lookup):
     """Return the material number string for a name, or '100' if not found."""
     return lookup.get(name.upper(), "100")
+
+
+# ---------------------------------------------------------------------------
+# Material override (couple materials that are the same stock, e.g. 6 & 7)
+# ---------------------------------------------------------------------------
+
+def load_material_overrides(path):
+    """
+    Parse MAT_SETTINGS.txt and return {overridden_num: main_num}.
+
+    Each line: <main>,<overridden>   (comma or semicolon delimited)
+    Example:   6,7
+               means material 7 is reassigned to material 6 in the output.
+
+    Missing file -> empty dict (warning printed, no overrides applied).
+    Malformed lines are skipped with a warning; parsing continues.
+    """
+    overrides = {}
+
+    if not os.path.exists(path):
+        print(
+            "WARNING: Material settings file not found: '{}'. "
+            "No material overrides will be applied.".format(path),
+            file=sys.stderr,
+        )
+        return overrides
+
+    try:
+        encoding = detect_text_encoding(path)
+    except Exception:
+        encoding = "utf-8"
+
+    try:
+        with open(path, "r", encoding=encoding, errors="replace") as f:
+            for line_num, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                delimiter = ";" if ";" in line else ","
+                parts = [p.strip() for p in line.split(delimiter)]
+                if len(parts) < 2 or not parts[0] or not parts[1]:
+                    print(
+                        "WARNING: Skipping malformed line {} in material settings: '{}'".format(
+                            line_num, line),
+                        file=sys.stderr,
+                    )
+                    continue
+                main_num, overridden_num = parts[0], parts[1]
+                overrides[overridden_num] = main_num
+    except Exception as e:
+        print(
+            "WARNING: Failed to read material settings '{}': {}. "
+            "No material overrides will be applied.".format(path, e),
+            file=sys.stderr,
+        )
+        return {}
+
+    return overrides
+
+
+def apply_material_override(material_num, overrides):
+    """Return the overriding material number if one is configured, else unchanged."""
+    return overrides.get(material_num, material_num)
 
 
 # ---------------------------------------------------------------------------
@@ -303,14 +376,22 @@ def classify_bucket(package_value, module_seen):
 # Main parser
 # ---------------------------------------------------------------------------
 
-def parse_btl(input_path, mat_lookup, encoding=None):
+def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
     """
     Parse the BTL file.
+
+    mat_overrides: {overridden_material_num: main_material_num} dict from
+                   load_material_overrides(). Applied after the material name
+                   is resolved to a number, so FileARR always contains the
+                   final (overridden) material number.
 
     Returns:
       numbered_buckets : {bucket_int: [row_str, ...]}
       bucket0_rows     : [row_str, ...]
     """
+    if mat_overrides is None:
+        mat_overrides = {}
+
     # Determine encoding to use for reading; if not provided, detect it.
     if encoding is None:
         encoding = detect_text_encoding(input_path)
@@ -383,7 +464,8 @@ def parse_btl(input_path, mat_lookup, encoding=None):
 
         elif key == "MATERIAL:" and len(tokens) > 1:
             raw_name = strip_quotes(" ".join(tokens[1:]))
-            current["material_num"] = get_material_number(raw_name, mat_lookup)
+            resolved = get_material_number(raw_name, mat_lookup)
+            current["material_num"] = apply_material_override(resolved, mat_overrides)
 
         elif key == "MODULENUMBER:" and len(tokens) > 1:
             raw = strip_quotes(tokens[1])
@@ -540,6 +622,11 @@ def main(argv):
     # load_material_stock already warns if the file is missing; parsing continues
     # with all materials defaulting to 100.
 
+    # --- Material overrides (e.g. material 7 -> material 6) ------------------
+    mat_overrides = load_material_overrides(MAT_SETTINGS_PATH)
+    # load_material_overrides already warns if the file is missing; parsing
+    # continues with no overrides applied.
+
     # --- Detect input encoding so we can preserve Finnish characters in outputs
     try:
         btl_encoding = detect_text_encoding(input_path)
@@ -548,7 +635,8 @@ def main(argv):
 
     # --- Parse --------------------------------------------------------------
     try:
-        numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems = parse_btl(input_path, mat_lookup, encoding=btl_encoding)
+        numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems = parse_btl(
+            input_path, mat_lookup, mat_overrides=mat_overrides, encoding=btl_encoding)
     except UnicodeDecodeError as e:
         msg = "ERROR: Could not read BTL file (encoding problem): {}".format(e)
         print(msg, file=sys.stderr)
