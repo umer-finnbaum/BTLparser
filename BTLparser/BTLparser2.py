@@ -283,6 +283,36 @@ def compute_cut_type(processes):
 # BTL parser
 # ---------------------------------------------------------------------------
 
+def parse_count(token):
+    """Parse a COUNT value. Missing, invalid or < 1 -> 1."""
+    try:
+        n = int(float(token))
+    except (ValueError, TypeError):
+        return 1
+    return n if n > 1 else 1
+
+
+COPY_ID_OFFSET = 10000   # added once per copy number
+
+
+def expand_ids(base_id, count):
+    """
+    Return the list of integer IDs for a part.
+      count 1 -> [base_id]                            e.g. ["100"]
+      count 3 -> [1*1e6+id, 2*1e6+id, 3*1e6+id]       e.g. ["10100", "20100", "30100"]
+    A non-numeric ID cannot be offset, so it is repeated unchanged (with a warning).
+    """
+    if count <= 1:
+        return [base_id]
+    try:
+        base = int(base_id)
+    except (ValueError, TypeError):
+        print("WARNING: Non-numeric ID '{}' with COUNT {} - copies keep the original ID."
+              .format(base_id, count), file=sys.stderr)
+        return [base_id] * count
+    return [str(i * COPY_ID_OFFSET + base) for i in range(1, count + 1)]
+
+
 def parse_btl_processes(btl_path):
     """
     Parse one BTL file and return a list of process rows.
@@ -321,7 +351,7 @@ def parse_btl_processes(btl_path):
         if kw == "[PART]":
             if current is not None:
                 parts.append(current)
-            current     = {"id": "", "processes": []}
+            current     = {"id": "", "count": 1, "processes": []}
             pending_key = ""
             continue
 
@@ -330,6 +360,8 @@ def parse_btl_processes(btl_path):
 
         if kw == "SINGLEMEMBERNUMBER:" and len(tokens) > 1:
             current["id"] = tokens[1]
+        elif kw == "COUNT:" and len(tokens) > 1:
+            current["count"] = parse_count(tokens[1])
         elif kw == "PROCESSKEY:" and len(tokens) > 1:
             pending_key = tokens[1]
         elif kw == "PROCESSPARAMETERS:":
@@ -349,12 +381,15 @@ def parse_btl_processes(btl_path):
     for part in parts:
         n_procs  = str(len(part["processes"]))
         cut_type = compute_cut_type(part["processes"])
-        for proc in part["processes"]:
-            rows.append(
-                [part["id"], n_procs, proc["key"]]
-                + params_to_fields(proc["params"])
-                + [cut_type]
-            )
+        # COUNT > 1 -> the full process list is repeated for each copy,
+        # with IDs 10000+base, 20000+base, ...
+        for copy_id in expand_ids(part["id"], part["count"]):
+            for proc in part["processes"]:
+                rows.append(
+                    [copy_id, n_procs, proc["key"]]
+                    + params_to_fields(proc["params"])
+                    + [cut_type]
+                )
 
     return rows
 

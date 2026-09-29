@@ -268,6 +268,36 @@ def scale_dimension(token):
 # Row builders
 # ---------------------------------------------------------------------------
 
+def parse_count(token):
+    """Parse a COUNT value. Missing, invalid or < 1 -> 1."""
+    try:
+        n = int(float(token))
+    except (ValueError, TypeError):
+        return 1
+    return n if n > 1 else 1
+
+
+COPY_ID_OFFSET = 10000   # added once per copy number
+
+
+def expand_ids(base_id, count):
+    """
+    Return the list of integer IDs for a part.
+      count 1 -> [base_id]                            e.g. ["100"]
+      count 3 -> [1*1e6+id, 2*1e6+id, 3*1e6+id]       e.g. ["1000100", "2000100", "3000100"]
+    A non-numeric ID cannot be offset, so it is repeated unchanged (with a warning).
+    """
+    if count <= 1:
+        return [base_id]
+    try:
+        base = int(base_id)
+    except (ValueError, TypeError):
+        print("WARNING: Non-numeric ID '{}' with COUNT {} - copies keep the original ID."
+              .format(base_id, count), file=sys.stderr)
+        return [base_id] * count
+    return [str(i * COPY_ID_OFFSET + base) for i in range(1, count + 1)]
+
+
 def make_numbered_row(part):
     """
     Row for a named bucket (FileARR1 ... FileARR25).
@@ -406,6 +436,7 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
     def new_part():
         return {
             "single_member": "",
+            "count":         1,
             "material_num":  "100",
             "package":       "",
             "part_num":      "0",
@@ -425,12 +456,16 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
             return
         bucket = classify_bucket(part["package"], part["module_seen"])
         desig  = part.get("designation", "")
-        if bucket != 0:
-            numbered_buckets.setdefault(bucket, []).append(make_numbered_row(part))
-            numbered_elems.setdefault(bucket, []).append(desig)
-        else:
-            bucket0_rows.append(make_bucket0_row(part))
-            bucket0_elems.append(desig)
+        base_id = part.get("single_member", "")
+        # COUNT > 1 -> one entry per copy with IDs 10000+base, 20000+base, ...
+        for copy_id in expand_ids(base_id, part.get("count", 1)):
+            copy = dict(part, single_member=copy_id)
+            if bucket != 0:
+                numbered_buckets.setdefault(bucket, []).append(make_numbered_row(copy))
+                numbered_elems.setdefault(bucket, []).append(desig)
+            else:
+                bucket0_rows.append(make_bucket0_row(copy))
+                bucket0_elems.append(desig)
 
     # Try reading with the detected encoding; if strict UTF-8 fails, fall back to cp1252
     try:
@@ -461,6 +496,9 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
         # ----------------------------------------------------------------
         if key == "SINGLEMEMBERNUMBER:" and len(tokens) > 1:
             current["single_member"] = tokens[1]
+
+        elif key == "COUNT:" and len(tokens) > 1:
+            current["count"] = parse_count(tokens[1])
 
         elif key == "MATERIAL:" and len(tokens) > 1:
             raw_name = strip_quotes(" ".join(tokens[1:]))
