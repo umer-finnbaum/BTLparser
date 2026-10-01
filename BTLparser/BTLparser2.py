@@ -292,25 +292,122 @@ def parse_count(token):
     return n if n > 1 else 1
 
 
-COPY_ID_OFFSET = 10000   # added once per copy number
+COPY_ID_START = 20000   # first ID handed out to extra copies
+MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
+MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
+# All three can be overridden by BTLsettings.txt (see load_id_settings).
+
+BTL_SETTINGS_PATH = r"C:\FBtemp\356\BTL\BTLsettings.txt"
 
 
-def expand_ids(base_id, count):
+def load_id_settings(path=None):
     """
-    Return the list of integer IDs for a part.
-      count 1 -> [base_id]                            e.g. ["100"]
-      count 3 -> [1*1e6+id, 2*1e6+id, 3*1e6+id]       e.g. ["10100", "20100", "30100"]
-    A non-numeric ID cannot be offset, so it is repeated unchanged (with a warning).
+    Override COPY_ID_START, MAX_ID_VALUE and MAX_BASE_ID from BTLsettings.txt.
+
+    File format (one setting per line, spaces optional):
+        COPY_ID_START = 20000
+        MAX_ID_VALUE = 32000
+        MAX_BASE_ID = 9999
+
+    Missing file      -> built-in defaults are used (no warning).
+    Invalid line/value -> warning printed, that setting keeps its default.
     """
-    if count <= 1:
-        return [base_id]
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID
+    path = path or BTL_SETTINGS_PATH
+
+    if not os.path.isfile(path):
+        return
+
+    values = {}
     try:
-        base = int(base_id)
-    except (ValueError, TypeError):
-        print("WARNING: Non-numeric ID '{}' with COUNT {} - copies keep the original ID."
-              .format(base_id, count), file=sys.stderr)
-        return [base_id] * count
-    return [str(i * COPY_ID_OFFSET + base) for i in range(1, count + 1)]
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            for line_num, raw in enumerate(f, start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                if "=" not in line:
+                    print("WARNING: BTLsettings line {} ignored (no '='): '{}'"
+                          .format(line_num, line), file=sys.stderr)
+                    continue
+                key, val = (p.strip() for p in line.split("=", 1))
+                key = key.upper()
+                if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID"):
+                    print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
+                          .format(line_num, key), file=sys.stderr)
+                    continue
+                try:
+                    num = int(val)
+                    if num <= 0:
+                        raise ValueError
+                except ValueError:
+                    print("WARNING: BTLsettings line {} ignored (invalid value '{}' for {})."
+                          .format(line_num, val, key), file=sys.stderr)
+                    continue
+                values[key] = num
+    except OSError as e:
+        print("WARNING: Could not read '{}': {}. Using defaults.".format(path, e),
+              file=sys.stderr)
+        return
+
+    COPY_ID_START = values.get("COPY_ID_START", COPY_ID_START)
+    MAX_ID_VALUE  = values.get("MAX_ID_VALUE",  MAX_ID_VALUE)
+    MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
+
+    # Sanity checks - warn only, never stop the run
+    if COPY_ID_START <= MAX_BASE_ID:
+        print("WARNING: COPY_ID_START ({}) must be above MAX_BASE_ID ({}), "
+              "otherwise copy IDs can collide with original IDs."
+              .format(COPY_ID_START, MAX_BASE_ID), file=sys.stderr)
+    if COPY_ID_START > MAX_ID_VALUE:
+        print("WARNING: COPY_ID_START ({}) is above MAX_ID_VALUE ({})."
+              .format(COPY_ID_START, MAX_ID_VALUE), file=sys.stderr)
+
+    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}"
+          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID))
+
+
+class CopyIdAllocator:
+    """
+    Assigns IDs to parts with COUNT > 1, keeping every ID a small integer.
+
+      - The first copy keeps its original ID.
+      - Each extra copy gets the next free ID from a counter starting at
+        COPY_ID_START (default 20000), shared by all parts in the same BTL file.
+
+    Example (parts in file order):
+      ID 100, COUNT 3  ->  100, 20000, 20001
+      ID 205, COUNT 1  ->  205
+      ID 300, COUNT 2  ->  300, 20002
+
+    One allocator is used per BTL file, so the same file always produces the
+    same IDs - FileARR and Processes files stay consistent.
+    """
+
+    def __init__(self, start=None, limit=None):
+        # Read the module values at call time so BTLsettings.txt overrides apply
+        self.next_id = COPY_ID_START if start is None else start
+        self.limit   = MAX_ID_VALUE  if limit is None else limit
+        self._warned_limit = False
+
+    def expand(self, base_id, count):
+        """Return the list of IDs (as strings) for one part."""
+        try:
+            if int(base_id) > MAX_BASE_ID:
+                print("WARNING: ID {} exceeds {} and may collide with copy IDs "
+                      "starting at {}.".format(base_id, MAX_BASE_ID, COPY_ID_START),
+                      file=sys.stderr)
+        except (ValueError, TypeError):
+            pass
+
+        ids = [base_id]
+        for _ in range(count - 1):
+            if self.next_id > self.limit and not self._warned_limit:
+                print("WARNING: Copy ID {} exceeds the limit of {}."
+                      .format(self.next_id, self.limit), file=sys.stderr)
+                self._warned_limit = True
+            ids.append(str(self.next_id))
+            self.next_id += 1
+        return ids
 
 
 def parse_btl_processes(btl_path):
@@ -378,12 +475,13 @@ def parse_btl_processes(btl_path):
         raise ValueError("No [PART] entries found in: {}".format(btl_path))
 
     rows = []
+    id_alloc = CopyIdAllocator()   # IDs for COUNT > 1 copies, per BTL file
     for part in parts:
         n_procs  = str(len(part["processes"]))
         cut_type = compute_cut_type(part["processes"])
         # COUNT > 1 -> the full process list is repeated for each copy,
-        # with IDs 10000+base, 20000+base, ...
-        for copy_id in expand_ids(part["id"], part["count"]):
+        # first copy keeps the ID, extra copies get 10001, 10002, ...
+        for copy_id in id_alloc.expand(part["id"], part["count"]):
             for proc in part["processes"]:
                 rows.append(
                     [copy_id, n_procs, proc["key"]]
@@ -439,6 +537,7 @@ def write_error_file(output_dir, messages, encoding="utf-8-sig"):
 # ---------------------------------------------------------------------------
 
 def main(argv):
+    load_id_settings()   # optional BTLsettings.txt overrides
     # Exit codes:
     #   1 = success — all Processes files written with rows
     #   2 = BTL path error or wrong arguments
