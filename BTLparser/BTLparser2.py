@@ -45,6 +45,7 @@ Exit codes: 1 = success, 0 = failure, 2 = bad arguments
 import os
 import sys
 import csv
+import datetime
 
 # ---------------------------------------------------------------------------
 # Configuration  — edit these two paths to match your environment
@@ -52,6 +53,7 @@ import csv
 
 OUTPUT_DIR   = r"C:\FBtemp\356\BTL"
 MAPPING_PATH = r"C:\FBtemp\356\BTL\mapping.txt"
+PARSE_STATUS_FILE = "ParseStatusProcess.txt"
 
 BTL_ROOT     = r"Z:\Saha"
 BTL_TEMPLATE = "{root}\\{project}\\{building}\\{project}.btl"
@@ -295,24 +297,26 @@ def parse_count(token):
 COPY_ID_START = 20000   # first ID handed out to extra copies
 MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
 MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
-# All three can be overridden by BTLsettings.txt (see load_id_settings).
+COUNT_ENABLED = False    # False -> COUNT is ignored (treated as 1), no duplicate IDs
+# All four can be overridden by BTLsettings.txt (see load_id_settings).
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\BTL\BTLsettings.txt"
 
 
 def load_id_settings(path=None):
     """
-    Override COPY_ID_START, MAX_ID_VALUE and MAX_BASE_ID from BTLsettings.txt.
+    Override COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID and COUNT_ENABLED from BTLsettings.txt.
 
     File format (one setting per line, spaces optional):
         COPY_ID_START = 20000
         MAX_ID_VALUE = 32000
         MAX_BASE_ID = 9999
+        COUNT_ENABLED = 1      (1/0, ON/OFF, TRUE/FALSE, YES/NO)
 
     Missing file      -> built-in defaults are used (no warning).
     Invalid line/value -> warning printed, that setting keeps its default.
     """
-    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED
     path = path or BTL_SETTINGS_PATH
 
     if not os.path.isfile(path):
@@ -331,6 +335,16 @@ def load_id_settings(path=None):
                     continue
                 key, val = (p.strip() for p in line.split("=", 1))
                 key = key.upper()
+                if key == "COUNT_ENABLED":
+                    flag = val.upper()
+                    if flag in ("1", "ON", "TRUE", "YES"):
+                        values[key] = True
+                    elif flag in ("0", "OFF", "FALSE", "NO"):
+                        values[key] = False
+                    else:
+                        print("WARNING: BTLsettings line {} ignored (invalid value '{}' for "
+                              "COUNT_ENABLED, use 1 or 0).".format(line_num, val), file=sys.stderr)
+                    continue
                 if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID"):
                     print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
                           .format(line_num, key), file=sys.stderr)
@@ -352,6 +366,7 @@ def load_id_settings(path=None):
     COPY_ID_START = values.get("COPY_ID_START", COPY_ID_START)
     MAX_ID_VALUE  = values.get("MAX_ID_VALUE",  MAX_ID_VALUE)
     MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
+    COUNT_ENABLED = values.get("COUNT_ENABLED", COUNT_ENABLED)
 
     # Sanity checks - warn only, never stop the run
     if COPY_ID_START <= MAX_BASE_ID:
@@ -362,8 +377,8 @@ def load_id_settings(path=None):
         print("WARNING: COPY_ID_START ({}) is above MAX_ID_VALUE ({})."
               .format(COPY_ID_START, MAX_ID_VALUE), file=sys.stderr)
 
-    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}"
-          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID))
+    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}"
+          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, "ON" if COUNT_ENABLED else "OFF"))
 
 
 class CopyIdAllocator:
@@ -391,6 +406,8 @@ class CopyIdAllocator:
 
     def expand(self, base_id, count):
         """Return the list of IDs (as strings) for one part."""
+        if not COUNT_ENABLED:
+            count = 1   # COUNT handling switched off -> one entry, original ID
         try:
             if int(base_id) > MAX_BASE_ID:
                 print("WARNING: ID {} exceeds {} and may collide with copy IDs "
@@ -507,29 +524,94 @@ def write_process_file(path, btl_path, rows, encoding="utf-8"):
             f.write("\r\n")
 
 
-def write_error_file(output_dir, messages, encoding="utf-8-sig"):
+class ParseStatus:
     """
-    Overwrite OUTPUT_DIR/error.txt. Format:
-      - If messages is empty: first line "0"
-      - Otherwise: first line = number of errors, then each error on a new line.
-    Uses utf-8-sig by default so Notepad shows Finnish characters correctly.
+    Collects everything that happens during a run and writes ParseStatusProcess.txt.
+
+    File layout (CRLF, one KEY=value per line, then one block per BTL file):
+
+        RESULT=OK                     OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
+        EXITCODE=1
+        TIME=2026-10-01 14:05:12
+        MODE=MANUAL                   MANUAL | AUTO | UNKNOWN
+        FILES=1
+        ERRORS=0
+        WARNINGS=0
+
+        [Processes1.txt]
+        BTL=Z:\\Saha\\356\\12\\356.btl
+        STATUS=OK                     OK | NOT_FOUND | READ_ERROR | WRITE_ERROR | NO_PROCESSES
+        IDS=12
+        PROCESSROWS=40
+        Element,ProjectID,BuildingID,ProcessesFile
+        1,,,1
+        2,,,1
+
+        [MESSAGES]
+        ERROR: ...
+        WARNING: ...
     """
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        err_path = os.path.join(output_dir, "error.txt")
-        with open(err_path, "w", encoding=encoding, newline="") as ef:
-            if not messages:
-                ef.write("0")
-                ef.write("\r\n")
-            else:
-                ef.write(str(len(messages)))
-                ef.write("\r\n")
-                for m in messages:
-                    ef.write(m)
-                    ef.write("\r\n")
-    except OSError:
-        # If even writing the error file fails, nothing we can do here.
-        pass
+
+    def __init__(self):
+        self.mode     = "UNKNOWN"
+        self.files    = []      # list of dicts, one per Processes<N>.txt
+        self.errors   = []
+        self.warnings = []
+
+    def error(self, msg):
+        print(msg, file=sys.stderr)
+        self.errors.append(msg)
+
+    def warning(self, msg):
+        print(msg, file=sys.stderr)
+        self.warnings.append(msg)
+
+    def add_file(self, file_num, btl_path, status, process_rows, mapping_rows):
+        ids = len({r[0] for r in process_rows})
+        self.files.append({
+            "file_num":     file_num,
+            "btl":          btl_path,
+            "status":       status,
+            "ids":          ids,
+            "rows":         len(process_rows),
+            "mapping_rows": mapping_rows,
+        })
+
+    def write(self, result, exit_code, encoding="utf-8"):
+        lines = [
+            "RESULT={}".format(result),
+            "EXITCODE={}".format(exit_code),
+            "TIME={}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "MODE={}".format(self.mode),
+            "FILES={}".format(len(self.files)),
+            "ERRORS={}".format(len(self.errors)),
+            "WARNINGS={}".format(len(self.warnings)),
+        ]
+        for f in self.files:
+            lines += [
+                "",
+                "[Processes{}.txt]".format(f["file_num"]),
+                "BTL={}".format(f["btl"]),
+                "STATUS={}".format(f["status"]),
+                "IDS={}".format(f["ids"]),
+                "PROCESSROWS={}".format(f["rows"]),
+                MAPPING_HEADER,
+            ]
+            for r in f["mapping_rows"]:
+                lines.append("{},{},{},{}".format(
+                    r["element"], r["project"], r["building"], r["file_num"]))
+        if self.errors or self.warnings:
+            lines += ["", "[MESSAGES]"] + self.errors + self.warnings
+
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(os.path.join(OUTPUT_DIR, PARSE_STATUS_FILE), "w",
+                      encoding=encoding, errors="replace", newline="") as sf:
+                for line in lines:
+                    sf.write(line)
+                    sf.write("\r\n")
+        except OSError as e:
+            print("ERROR: Could not write {}: {}".format(PARSE_STATUS_FILE, e), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -547,60 +629,56 @@ def main(argv):
     #       (file found and readable but yielded no usable data,
     #        or a non-path error such as a write failure)
 
+    status = ParseStatus()
+
     # argv[0] = exe name; optional argv[1] = manual BTL path
     if len(argv) not in (1, 2):
-        print(
-            "Usage:\n"
-            "  Normal: btl_process_extractor.exe\n"
-            "  Manual: btl_process_extractor.exe <btl_path>",
-            file=sys.stderr,
+        status.error(
+            "ERROR: Wrong number of arguments ({}). Usage: "
+            "btl_process_extractor.exe [<btl_path>]".format(len(argv) - 1)
         )
+        status.write("ARGUMENT_ERROR", 2)
         return 2
 
     manual_btl_path = argv[1] if len(argv) == 2 else None
 
-    # Collect non-fatal error messages to write into error.txt at the end.
-    errors = []
-
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
     except OSError as e:
-        msg = "ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e)
-        print(msg, file=sys.stderr)
-        # Try to write error file (will attempt to create the dir); fallback encoding
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e))
+        status.write("ERROR", 0)
         return 0
 
     # --- Load mapping -------------------------------------------------------
     try:
         rows, manual_mode, mapping_encoding, mapping_delimiter = load_mapping(MAPPING_PATH)
     except FileNotFoundError as e:
-        msg = "ERROR: {}".format(e)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: {}".format(e))
+        status.write("PATH_ERROR", 2)
         return 2
     except (OSError, ValueError) as e:
-        msg = "ERROR: {}".format(e)
-        print(msg, file=sys.stderr)
-        # If mapping exists but couldn't be parsed, write error file
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: {}".format(e))
+        status.write("ERROR", 0)
         return 0
+
+    status.mode = "MANUAL" if manual_mode else "AUTO"
+    # Same encoding as mapping.txt, so CX Supervisor reads both files the same way
+    # (BOM dropped so line 1 always reads exactly "RESULT=...")
+    status_encoding = "utf-8" if mapping_encoding in (None, "utf-8-sig") else mapping_encoding
 
     # Validate argument consistency
     if manual_mode and manual_btl_path is None:
-        msg = (
+        status.error(
             "ERROR: Mapping has empty ProjectID/BuildingID (manual mode) "
             "but no BTL path was provided as argument."
         )
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.write("ARGUMENT_ERROR", 2, status_encoding)
         return 2
 
     if not manual_mode and manual_btl_path is not None:
-        print(
+        status.warning(
             "WARNING: BTL path argument supplied but mapping has "
-            "ProjectID/BuildingID values — argument will be ignored.",
-            file=sys.stderr,
+            "ProjectID/BuildingID values - argument will be ignored."
         )
 
     # --- Build (file_num, btl_path) pairs -----------------------------------
@@ -635,13 +713,9 @@ def main(argv):
                     os.remove(os.path.join(OUTPUT_DIR, fname))
                     print("Deleted stale: {}".format(fname))
                 except OSError as e:
-                    warn = "WARNING: Could not delete '{}': {}".format(fname, e)
-                    print(warn, file=sys.stderr)
-                    errors.append(warn)
+                    status.warning("WARNING: Could not delete '{}': {}".format(fname, e))
     except OSError as e:
-        warn = "WARNING: Could not list output directory '{}': {}".format(OUTPUT_DIR, e)
-        print(warn, file=sys.stderr)
-        errors.append(warn)
+        status.warning("WARNING: Could not list output directory '{}': {}".format(OUTPUT_DIR, e))
 
     # --- Parse each BTL and write Processes<N>.txt --------------------------
     files_written  = 0
@@ -650,21 +724,22 @@ def main(argv):
 
     for file_num, btl_path in pairs:
         out_path = os.path.join(OUTPUT_DIR, "Processes{}.txt".format(file_num))
+        file_status = "OK"
 
         try:
             process_rows = parse_btl_processes(btl_path)
             print("Parsed '{}': {} process row(s).".format(btl_path, len(process_rows)))
+            if not process_rows:
+                file_status = "NO_PROCESSES"
         except FileNotFoundError as e:
-            msg = "ERROR: {}".format(e)
-            print(msg, file=sys.stderr)
+            status.error("ERROR: {}".format(e))
             failed_paths.append(btl_path)
-            errors.append(msg)
             process_rows = []
+            file_status = "NOT_FOUND"
         except (OSError, ValueError) as e:
-            msg = "ERROR: {}".format(e)
-            print(msg, file=sys.stderr)
-            errors.append(msg)
+            status.error("ERROR: {}".format(e))
             process_rows = []
+            file_status = "READ_ERROR"
 
         try:
             # Write Processes file using mapping encoding to preserve Finnish chars in mapping-related text
@@ -672,48 +747,34 @@ def main(argv):
             files_written += 1
             total_rows    += len(process_rows)
         except OSError as e:
-            msg = "ERROR: Could not write '{}': {}".format(out_path, e)
-            print(msg, file=sys.stderr)
-            errors.append(msg)
+            status.error("ERROR: Could not write '{}': {}".format(out_path, e))
+            file_status = "WRITE_ERROR"
 
-    # --- Write status.txt ---------------------------------------------------
-    # Always written; first line = number of BTL path errors, then one path
-    # per line. Zero errors produces a single line containing "0".
-    status_path = os.path.join(OUTPUT_DIR, "status.txt")
-    try:
-        with open(status_path, "w", encoding=mapping_encoding or "utf-8", newline="") as sf:
-            sf.write(str(len(failed_paths)))
-            sf.write("\r\n")
-            for fp in failed_paths:
-                sf.write(fp)
-                sf.write("\r\n")
-    except OSError as e:
-        msg = "ERROR: Could not write status.txt: {}".format(e)
-        print(msg, file=sys.stderr)
-        errors.append(msg)
+        status.add_file(
+            file_num, btl_path, file_status, process_rows,
+            [r for r in rows if r["file_num"] == file_num],
+        )
 
     # --- Update mapping -----------------------------------------------------
     try:
         write_mapping(MAPPING_PATH, rows, encoding=mapping_encoding, delimiter=mapping_delimiter)
         print("Mapping updated: {} ({} element(s)).".format(MAPPING_PATH, len(rows)))
     except OSError as e:
-        msg = "ERROR: Could not update mapping file: {}".format(e)
-        print(msg, file=sys.stderr)
-        errors.append(msg)
-
-    # Always overwrite error.txt: no errors => write "0", else write collected messages.
-    write_error_file(OUTPUT_DIR, errors)
+        status.error("ERROR: Could not update mapping file: {}".format(e))
 
     print("Done: {} Processes file(s), {} total process row(s).".format(
         files_written, total_rows))
 
     # Determine exit code
     if failed_paths:
-        return 2                    # at least one BTL path was not found
+        exit_code, result = 2, "PATH_ERROR"   # at least one BTL path was not found
     elif total_rows > 0:
-        return 1                    # all paths OK and processes were produced
+        exit_code, result = 1, "OK"           # all paths OK and processes were produced
     else:
-        return 0                    # all paths OK but no processes extracted
+        exit_code, result = 0, "NO_DATA"      # all paths OK but no processes extracted
+
+    status.write(result, exit_code, status_encoding)
+    return exit_code
 
 
 if __name__ == "__main__":

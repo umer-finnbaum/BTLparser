@@ -68,6 +68,7 @@ Usage
 
 import os
 import sys
+import datetime
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -280,24 +281,26 @@ def parse_count(token):
 COPY_ID_START = 20000   # first ID handed out to extra copies
 MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
 MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
-# All three can be overridden by BTLsettings.txt (see load_id_settings).
+COUNT_ENABLED = False    # False -> COUNT is ignored (treated as 1), no duplicate IDs
+# All four can be overridden by BTLsettings.txt (see load_id_settings).
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\BTL\BTLsettings.txt"
 
 
 def load_id_settings(path=None):
     """
-    Override COPY_ID_START, MAX_ID_VALUE and MAX_BASE_ID from BTLsettings.txt.
+    Override COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID and COUNT_ENABLED from BTLsettings.txt.
 
     File format (one setting per line, spaces optional):
         COPY_ID_START = 20000
         MAX_ID_VALUE = 32000
         MAX_BASE_ID = 9999
+        COUNT_ENABLED = 1      (1/0, ON/OFF, TRUE/FALSE, YES/NO)
 
     Missing file      -> built-in defaults are used (no warning).
     Invalid line/value -> warning printed, that setting keeps its default.
     """
-    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED
     path = path or BTL_SETTINGS_PATH
 
     if not os.path.isfile(path):
@@ -316,6 +319,16 @@ def load_id_settings(path=None):
                     continue
                 key, val = (p.strip() for p in line.split("=", 1))
                 key = key.upper()
+                if key == "COUNT_ENABLED":
+                    flag = val.upper()
+                    if flag in ("1", "ON", "TRUE", "YES"):
+                        values[key] = True
+                    elif flag in ("0", "OFF", "FALSE", "NO"):
+                        values[key] = False
+                    else:
+                        print("WARNING: BTLsettings line {} ignored (invalid value '{}' for "
+                              "COUNT_ENABLED, use 1 or 0).".format(line_num, val), file=sys.stderr)
+                    continue
                 if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID"):
                     print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
                           .format(line_num, key), file=sys.stderr)
@@ -337,6 +350,7 @@ def load_id_settings(path=None):
     COPY_ID_START = values.get("COPY_ID_START", COPY_ID_START)
     MAX_ID_VALUE  = values.get("MAX_ID_VALUE",  MAX_ID_VALUE)
     MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
+    COUNT_ENABLED = values.get("COUNT_ENABLED", COUNT_ENABLED)
 
     # Sanity checks - warn only, never stop the run
     if COPY_ID_START <= MAX_BASE_ID:
@@ -347,8 +361,8 @@ def load_id_settings(path=None):
         print("WARNING: COPY_ID_START ({}) is above MAX_ID_VALUE ({})."
               .format(COPY_ID_START, MAX_ID_VALUE), file=sys.stderr)
 
-    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}"
-          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID))
+    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}"
+          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, "ON" if COUNT_ENABLED else "OFF"))
 
 
 class CopyIdAllocator:
@@ -376,6 +390,8 @@ class CopyIdAllocator:
 
     def expand(self, base_id, count):
         """Return the list of IDs (as strings) for one part."""
+        if not COUNT_ENABLED:
+            count = 1   # COUNT handling switched off -> one entry, original ID
         try:
             if int(base_id) > MAX_BASE_ID:
                 print("WARNING: ID {} exceeds {} and may collide with copy IDs "
@@ -650,29 +666,94 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
 # Output writer
 # ---------------------------------------------------------------------------
 
-def write_error_file(output_dir, messages, encoding="utf-8-sig"):
+PARSE_STATUS_FILE = "ParseStatusElements.txt"
+
+
+def output_file_names():
+    """All FileARR / ElemFileARR names, in the exact order write_outputs() writes them."""
+    names = []
+    for bucket in NUMBERED_BUCKETS:
+        names += ["FileARR{}.txt".format(bucket), "ElemFileARR{}.txt".format(bucket)]
+    names += ["FileARR.txt", "ElemFileARR.txt"]
+    return names
+
+
+class ParseStatus:
     """
-    Write (overwrite) an error.txt file to the output directory containing messages.
-    If messages is empty, write a single line "0". Otherwise the first line is
-    the number of errors and each subsequent line is one error message.
-    Uses utf-8-sig by default so Notepad shows Finnish characters correctly.
+    Collects everything that happens during a run and writes ParseStatusElements.txt.
+    Same layout as ParseStatusProcess.txt from BTLparser2:
+
+        RESULT=OK                 OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
+        EXITCODE=1
+        TIME=2026-10-01 14:05:12
+        BTL=C:\\path\\to\\file.btl
+        MATERIALS=46              materials loaded from fb_MAT_STOCK.txt
+        MATOVERRIDES=1            pairs loaded from MAT_SETTINGS.txt
+        TOTAL PARTS=12            all parts in the FileARR files, incl. COUNT copies
+        ERRORS=0
+        WARNINGS=0
+
+        [FileARR1.txt]
+        STATUS=OK                 OK | EMPTY | WRITE_ERROR | NOT_WRITTEN
+        PARTS=5                   parts incl. COUNT copies (same as line 1 of the file)
+
+        [ElemFileARR1.txt]
+        STATUS=OK
+        PARTS=5
+        ...
+        [MESSAGES]
+        ERROR: ...
+        WARNING: ...
     """
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        err_path = os.path.join(output_dir, "error.txt")
-        with open(err_path, "w", encoding=encoding, newline="") as ef:
-            if not messages:
-                ef.write("0")
-                ef.write("\r\n")
-            else:
-                ef.write(str(len(messages)))
-                ef.write("\r\n")
-                for m in messages:
-                    ef.write(m)
-                    ef.write("\r\n")
-    except OSError:
-        # If even writing the error file fails, there's nothing we can do here.
-        pass
+
+    def __init__(self, btl_path=""):
+        self.btl          = btl_path
+        self.materials    = ""
+        self.mat_overrides = ""
+        self.total_parts  = 0
+        self.files        = []      # (name, status, rows)
+        self.errors       = []
+        self.warnings     = []
+
+    def error(self, msg):
+        print(msg, file=sys.stderr)
+        self.errors.append(msg)
+
+    def warning(self, msg):
+        print(msg, file=sys.stderr)
+        self.warnings.append(msg)
+
+    def add_file(self, name, status, rows):
+        self.files.append((name, status, rows))
+
+    def write(self, result, exit_code, encoding="utf-8"):
+        if encoding in (None, "utf-8-sig"):
+            encoding = "utf-8"          # no BOM, so line 1 reads exactly "RESULT=..."
+        lines = [
+            "RESULT={}".format(result),
+            "EXITCODE={}".format(exit_code),
+            "TIME={}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "BTL={}".format(self.btl),
+            "MATERIALS={}".format(self.materials),
+            "MATOVERRIDES={}".format(self.mat_overrides),
+            "TOTAL PARTS={}".format(self.total_parts),
+            "ERRORS={}".format(len(self.errors)),
+            "WARNINGS={}".format(len(self.warnings)),
+        ]
+        for name, status, rows in self.files:
+            lines += ["", "[{}]".format(name), "STATUS={}".format(status), "PARTS={}".format(rows)]
+        if self.errors or self.warnings:
+            lines += ["", "[MESSAGES]"] + self.errors + self.warnings
+
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(os.path.join(OUTPUT_DIR, PARSE_STATUS_FILE), "w",
+                      encoding=encoding, errors="replace", newline="") as sf:
+                for line in lines:
+                    sf.write(line)
+                    sf.write("\r\n")
+        except OSError as e:
+            print("ERROR: Could not write {}: {}".format(PARSE_STATUS_FILE, e), file=sys.stderr)
 
 
 def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems, output_dir, encoding="utf-8"):
@@ -719,38 +800,37 @@ def main(argv):
     #   2 = bad argument    (ELSEIF exitCode=2 -> "Wrong argument / BTL path")
 
     if len(argv) != 2:
-        print("Usage: BTLparser.exe <input.btl>", file=sys.stderr)
+        status = ParseStatus()
+        status.error("ERROR: Wrong number of arguments ({}). Usage: BTLparser.exe <input.btl>"
+                     .format(len(argv) - 1))
+        status.write("ARGUMENT_ERROR", 2)
         return 2
 
     input_path = argv[1]
+    status = ParseStatus(input_path)
 
     # --- Input validation ---------------------------------------------------
     if not os.path.exists(input_path):
-        msg = "ERROR: BTL file not found: {}".format(input_path)
-        print(msg, file=sys.stderr)
-        # write an error file too (use default encoding)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: BTL file not found: {}".format(input_path))
+        status.write("PATH_ERROR", 2)
         return 2
 
     if not os.path.isfile(input_path):
-        msg = "ERROR: Path is not a file: {}".format(input_path)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Path is not a file: {}".format(input_path))
+        status.write("PATH_ERROR", 2)
         return 2
 
     if os.path.getsize(input_path) == 0:
-        msg = "ERROR: BTL file is empty: {}".format(input_path)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: BTL file is empty: {}".format(input_path))
+        status.write("NO_DATA", 0)
         return 0
 
     # --- Output directory ---------------------------------------------------
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
     except OSError as e:
-        msg = "ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e))
+        status.write("ERROR", 0)
         return 0
 
     # --- Material stock -----------------------------------------------------
@@ -758,11 +838,16 @@ def main(argv):
     mat_lookup = load_material_stock(MAT_STOCK_PATH)
     # load_material_stock already warns if the file is missing; parsing continues
     # with all materials defaulting to 100.
+    status.materials = len(mat_lookup)
+    if not mat_lookup:
+        status.warning("WARNING: No materials loaded from '{}' - all materials reported as 100."
+                       .format(MAT_STOCK_PATH))
 
     # --- Material overrides (e.g. material 7 -> material 6) ------------------
     mat_overrides = load_material_overrides(MAT_SETTINGS_PATH)
     # load_material_overrides already warns if the file is missing; parsing
     # continues with no overrides applied.
+    status.mat_overrides = len(mat_overrides)
 
     # --- Detect input encoding so we can preserve Finnish characters in outputs
     try:
@@ -775,43 +860,65 @@ def main(argv):
         numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems = parse_btl(
             input_path, mat_lookup, mat_overrides=mat_overrides, encoding=btl_encoding)
     except UnicodeDecodeError as e:
-        msg = "ERROR: Could not read BTL file (encoding problem): {}".format(e)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Could not read BTL file (encoding problem): {}".format(e))
+        status.write("ERROR", 0, btl_encoding)
         return 0
     except OSError as e:
-        msg = "ERROR: Failed to read BTL file: {}".format(e)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Failed to read BTL file: {}".format(e))
+        status.write("ERROR", 0, btl_encoding)
         return 0
     except Exception as e:
-        msg = "ERROR: Unexpected error while parsing BTL: {}".format(e)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Unexpected error while parsing BTL: {}".format(e))
+        status.write("ERROR", 0, btl_encoding)
         return 0
 
     total_numbered = sum(len(v) for v in numbered_buckets.values())
     total_b0       = len(bucket0_rows)
+    status.total_parts = total_numbered + total_b0
 
     if total_numbered + total_b0 == 0:
-        msg = "WARNING: No [PART] entries found in '{}'.".format(input_path)
-        print(msg, file=sys.stderr)
-        # This is considered a warning/empty result — preserve that in error.txt
-        write_error_file(OUTPUT_DIR, [msg])
+        status.warning("WARNING: No [PART] entries found in '{}'.".format(input_path))
+        status.write("NO_DATA", 0, btl_encoding)
         return 0  # Treated as empty/failure by CX Supervisor
+
+    # Parts without a supported package end up in FileARR / ElemFileARR.
+    # CX Supervisor cannot process these, so report them as a warning (not an error).
+    if bucket0_rows:
+        packages = sorted({row.rsplit(",", 1)[-1] or "(empty)" for row in bucket0_rows})
+        status.warning(
+            "WARNING: {} part(s) without a supported PACKAGE written to FileARR.txt / "
+            "ElemFileARR.txt (PACKAGE: {}).".format(len(bucket0_rows), ", ".join(packages))
+        )
+
+    # Row counts per output file, in write order
+    row_counts = {}
+    for bucket in NUMBERED_BUCKETS:
+        row_counts["FileARR{}.txt".format(bucket)]     = len(numbered_buckets.get(bucket, []))
+        row_counts["ElemFileARR{}.txt".format(bucket)] = len(numbered_elems.get(bucket, []))
+    row_counts["FileARR.txt"]     = len(bucket0_rows)
+    row_counts["ElemFileARR.txt"] = len(bucket0_elems)
 
     # --- Write outputs ------------------------------------------------------
     try:
         write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems, OUTPUT_DIR, encoding=btl_encoding)
     except OSError as e:
-        msg = "ERROR: Failed to write output files: {}".format(e)
-        print(msg, file=sys.stderr)
-        write_error_file(OUTPUT_DIR, [msg])
+        status.error("ERROR: Failed to write output files: {}".format(e))
+        # Files before the failing one were written, the failing one and later ones were not
+        failed = os.path.basename(getattr(e, "filename", "") or "")
+        reached = False
+        for name in output_file_names():
+            if name == failed:
+                status.add_file(name, "WRITE_ERROR", row_counts[name])
+                reached = True
+            elif reached or not failed:
+                status.add_file(name, "NOT_WRITTEN", row_counts[name])
+            else:
+                status.add_file(name, "OK" if row_counts[name] else "EMPTY", row_counts[name])
+        status.write("ERROR", 0, btl_encoding)
         return 0
 
-    # --- Clear previous error file (no errors) -------------------------------
-    # Overwrite error.txt with "0" to indicate no errors — avoids stale old content.
-    write_error_file(OUTPUT_DIR, [])
+    for name in output_file_names():
+        status.add_file(name, "OK" if row_counts[name] else "EMPTY", row_counts[name])
 
     # --- Summary ------------------------------------------------------------
     print("Parsed {} parts total ({} classified, {} unclassified).".format(
@@ -823,6 +930,7 @@ def main(argv):
             print("  FileARR{}: {}".format(bucket, count))
     print("Output written to: {}".format(OUTPUT_DIR))
 
+    status.write("OK", 1, btl_encoding)
     return 1  # Success
 
 
