@@ -297,26 +297,29 @@ def parse_count(token):
 COPY_ID_START = 20000   # first ID handed out to extra copies
 MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
 MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
-COUNT_ENABLED = False    # False -> COUNT is ignored (treated as 1), no duplicate IDs
-# All four can be overridden by BTLsettings.txt (see load_id_settings).
+COUNT_ENABLED = True    # False -> COUNT is ignored (treated as 1), no duplicate IDs
+MESSAGE_WIDTH = 80      # max characters per error/warning line in the status file
+# All five can be overridden by BTLsettings.txt (see load_id_settings).
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\BTL\BTLsettings.txt"
 
 
 def load_id_settings(path=None):
     """
-    Override COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID and COUNT_ENABLED from BTLsettings.txt.
+    Override COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED and
+    MESSAGE_WIDTH from BTLsettings.txt.
 
     File format (one setting per line, spaces optional):
         COPY_ID_START = 20000
         MAX_ID_VALUE = 32000
         MAX_BASE_ID = 9999
         COUNT_ENABLED = 1      (1/0, ON/OFF, TRUE/FALSE, YES/NO)
+        MESSAGE_WIDTH = 80
 
     Missing file      -> built-in defaults are used (no warning).
     Invalid line/value -> warning printed, that setting keeps its default.
     """
-    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED, MESSAGE_WIDTH
     path = path or BTL_SETTINGS_PATH
 
     if not os.path.isfile(path):
@@ -345,7 +348,7 @@ def load_id_settings(path=None):
                         print("WARNING: BTLsettings line {} ignored (invalid value '{}' for "
                               "COUNT_ENABLED, use 1 or 0).".format(line_num, val), file=sys.stderr)
                     continue
-                if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID"):
+                if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID", "MESSAGE_WIDTH"):
                     print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
                           .format(line_num, key), file=sys.stderr)
                     continue
@@ -367,6 +370,11 @@ def load_id_settings(path=None):
     MAX_ID_VALUE  = values.get("MAX_ID_VALUE",  MAX_ID_VALUE)
     MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
     COUNT_ENABLED = values.get("COUNT_ENABLED", COUNT_ENABLED)
+    MESSAGE_WIDTH = values.get("MESSAGE_WIDTH", MESSAGE_WIDTH)
+    if MESSAGE_WIDTH < 20:
+        print("WARNING: MESSAGE_WIDTH ({}) too small, using 20.".format(MESSAGE_WIDTH),
+              file=sys.stderr)
+        MESSAGE_WIDTH = 20
 
     # Sanity checks - warn only, never stop the run
     if COPY_ID_START <= MAX_BASE_ID:
@@ -377,8 +385,47 @@ def load_id_settings(path=None):
         print("WARNING: COPY_ID_START ({}) is above MAX_ID_VALUE ({})."
               .format(COPY_ID_START, MAX_ID_VALUE), file=sys.stderr)
 
-    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}"
-          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, "ON" if COUNT_ENABLED else "OFF"))
+    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}, "
+          "MESSAGE_WIDTH={}".format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID,
+                                    "ON" if COUNT_ENABLED else "OFF", MESSAGE_WIDTH))
+
+def wrap_message(msg):
+    """
+    Word-wrap one error/warning to MESSAGE_WIDTH characters per line.
+    Continuation lines start with two spaces, so every new message still
+    begins with "ERROR:" / "WARNING:" at column 1.
+    Words longer than a line (e.g. file paths) are split after a \\ or /
+    where possible, otherwise at the line limit.
+    """
+    indent = "  "
+    lines, cur = [], ""
+
+    def room():
+        # first line has the full width, continuation lines lose the indent
+        return MESSAGE_WIDTH - (len(indent) if lines else 0)
+
+    for word in msg.split():
+        candidate = word if not cur else cur + " " + word
+        if len(candidate) <= room():
+            cur = candidate
+            continue
+        if cur:
+            lines.append(cur)
+            cur = ""
+        while len(word) > room():
+            cut = room()
+            sep = max(word.rfind("\\", 0, cut), word.rfind("/", 0, cut))
+            if sep > 0:
+                cut = sep + 1          # keep the separator at the end of the line
+            lines.append(word[:cut])
+            word = word[cut:]
+        cur = word
+    if cur:
+        lines.append(cur)
+    if not lines:
+        return [msg]
+    return [lines[0]] + [indent + l for l in lines[1:]]
+
 
 
 class CopyIdAllocator:
@@ -528,32 +575,33 @@ class ParseStatus:
     """
     Collects everything that happens during a run and writes ParseStatusProcess.txt.
 
-    File layout (CRLF, one KEY=value per line, then one block per BTL file):
-
-        RESULT=OK                     OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
-        EXITCODE=1
+    Standard header (same structure in all status files):
+        CODE=1                    1 | 0 | 2
+        RESULT=OK                 OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
         TIME=2026-10-01 14:05:12
-        MODE=MANUAL                   MANUAL | AUTO | UNKNOWN
-        FILES=1
-        ERRORS=0
+        BTL=Z:\\Saha\\356\\12\\356.btl   manual: the argument; auto: all paths joined with ";"
+        TOTAL PARTS=12            unique IDs over all Processes files, incl. COUNT copies
+        ERRORS=1
         WARNINGS=0
+        ERROR: ...                errors first, then warnings; each wrapped to
+          continued text          MESSAGE_WIDTH chars, continuation lines start with 2 spaces
+
+    Program-specific part:
+        MODE=MANUAL               MANUAL | AUTO | UNKNOWN
+        FILES=1
 
         [Processes1.txt]
         BTL=Z:\\Saha\\356\\12\\356.btl
-        STATUS=OK                     OK | NOT_FOUND | READ_ERROR | WRITE_ERROR | NO_PROCESSES
+        STATUS=OK                 OK | NOT_FOUND | READ_ERROR | WRITE_ERROR | NO_PROCESSES
         IDS=12
         PROCESSROWS=40
         Element,ProjectID,BuildingID,ProcessesFile
         1,,,1
-        2,,,1
-
-        [MESSAGES]
-        ERROR: ...
-        WARNING: ...
     """
 
     def __init__(self):
         self.mode     = "UNKNOWN"
+        self.btl      = ""        # manual-mode BTL path
         self.files    = []      # list of dicts, one per Processes<N>.txt
         self.errors   = []
         self.warnings = []
@@ -578,14 +626,25 @@ class ParseStatus:
         })
 
     def write(self, result, exit_code, encoding="utf-8"):
+        # BTL path(s): the manual-mode argument, or every parsed BTL joined with ";"
+        btl = self.btl or ";".join(f["btl"] for f in self.files)
+        # --- Standard header (same structure in all status files) ---------
         lines = [
+            "CODE={}".format(exit_code),
             "RESULT={}".format(result),
-            "EXITCODE={}".format(exit_code),
             "TIME={}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "BTL={}".format(btl),
+            "TOTAL PARTS={}".format(sum(f["ids"] for f in self.files)),
+            #"ERRORS={}".format(len(self.errors)),
+            "WARNINGS={}".format(len(self.warnings)),
+        ]
+        # Messages directly follow: errors first, then warnings, each word-wrapped
+        for msg in self.errors + self.warnings:
+            lines += wrap_message(msg)
+        # --- Program-specific part -----------------------------------------
+        lines += [
             "MODE={}".format(self.mode),
             "FILES={}".format(len(self.files)),
-            "ERRORS={}".format(len(self.errors)),
-            "WARNINGS={}".format(len(self.warnings)),
         ]
         for f in self.files:
             lines += [
@@ -600,8 +659,6 @@ class ParseStatus:
             for r in f["mapping_rows"]:
                 lines.append("{},{},{},{}".format(
                     r["element"], r["project"], r["building"], r["file_num"]))
-        if self.errors or self.warnings:
-            lines += ["", "[MESSAGES]"] + self.errors + self.warnings
 
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -641,6 +698,7 @@ def main(argv):
         return 2
 
     manual_btl_path = argv[1] if len(argv) == 2 else None
+    status.btl = manual_btl_path or ""
 
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -662,6 +720,8 @@ def main(argv):
         return 0
 
     status.mode = "MANUAL" if manual_mode else "AUTO"
+    if not manual_mode:
+        status.btl = ""   # paths come from the mapping, listed per file
     # Same encoding as mapping.txt, so CX Supervisor reads both files the same way
     # (BOM dropped so line 1 always reads exactly "RESULT=...")
     status_encoding = "utf-8" if mapping_encoding in (None, "utf-8-sig") else mapping_encoding

@@ -281,26 +281,29 @@ def parse_count(token):
 COPY_ID_START = 20000   # first ID handed out to extra copies
 MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
 MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
-COUNT_ENABLED = False    # False -> COUNT is ignored (treated as 1), no duplicate IDs
-# All four can be overridden by BTLsettings.txt (see load_id_settings).
+COUNT_ENABLED = True    # False -> COUNT is ignored (treated as 1), no duplicate IDs
+MESSAGE_WIDTH = 80      # max characters per error/warning line in the status file
+# All five can be overridden by BTLsettings.txt (see load_id_settings).
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\BTL\BTLsettings.txt"
 
 
 def load_id_settings(path=None):
     """
-    Override COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID and COUNT_ENABLED from BTLsettings.txt.
+    Override COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED and
+    MESSAGE_WIDTH from BTLsettings.txt.
 
     File format (one setting per line, spaces optional):
         COPY_ID_START = 20000
         MAX_ID_VALUE = 32000
         MAX_BASE_ID = 9999
         COUNT_ENABLED = 1      (1/0, ON/OFF, TRUE/FALSE, YES/NO)
+        MESSAGE_WIDTH = 80
 
     Missing file      -> built-in defaults are used (no warning).
     Invalid line/value -> warning printed, that setting keeps its default.
     """
-    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED, MESSAGE_WIDTH
     path = path or BTL_SETTINGS_PATH
 
     if not os.path.isfile(path):
@@ -329,7 +332,7 @@ def load_id_settings(path=None):
                         print("WARNING: BTLsettings line {} ignored (invalid value '{}' for "
                               "COUNT_ENABLED, use 1 or 0).".format(line_num, val), file=sys.stderr)
                     continue
-                if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID"):
+                if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID", "MESSAGE_WIDTH"):
                     print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
                           .format(line_num, key), file=sys.stderr)
                     continue
@@ -351,6 +354,11 @@ def load_id_settings(path=None):
     MAX_ID_VALUE  = values.get("MAX_ID_VALUE",  MAX_ID_VALUE)
     MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
     COUNT_ENABLED = values.get("COUNT_ENABLED", COUNT_ENABLED)
+    MESSAGE_WIDTH = values.get("MESSAGE_WIDTH", MESSAGE_WIDTH)
+    if MESSAGE_WIDTH < 20:
+        print("WARNING: MESSAGE_WIDTH ({}) too small, using 20.".format(MESSAGE_WIDTH),
+              file=sys.stderr)
+        MESSAGE_WIDTH = 20
 
     # Sanity checks - warn only, never stop the run
     if COPY_ID_START <= MAX_BASE_ID:
@@ -361,8 +369,47 @@ def load_id_settings(path=None):
         print("WARNING: COPY_ID_START ({}) is above MAX_ID_VALUE ({})."
               .format(COPY_ID_START, MAX_ID_VALUE), file=sys.stderr)
 
-    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}"
-          .format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, "ON" if COUNT_ENABLED else "OFF"))
+    print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}, "
+          "MESSAGE_WIDTH={}".format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID,
+                                    "ON" if COUNT_ENABLED else "OFF", MESSAGE_WIDTH))
+
+def wrap_message(msg):
+    """
+    Word-wrap one error/warning to MESSAGE_WIDTH characters per line.
+    Continuation lines start with two spaces, so every new message still
+    begins with "ERROR:" / "WARNING:" at column 1.
+    Words longer than a line (e.g. file paths) are split after a \\ or /
+    where possible, otherwise at the line limit.
+    """
+    indent = "  "
+    lines, cur = [], ""
+
+    def room():
+        # first line has the full width, continuation lines lose the indent
+        return MESSAGE_WIDTH - (len(indent) if lines else 0)
+
+    for word in msg.split():
+        candidate = word if not cur else cur + " " + word
+        if len(candidate) <= room():
+            cur = candidate
+            continue
+        if cur:
+            lines.append(cur)
+            cur = ""
+        while len(word) > room():
+            cut = room()
+            sep = max(word.rfind("\\", 0, cut), word.rfind("/", 0, cut))
+            if sep > 0:
+                cut = sep + 1          # keep the separator at the end of the line
+            lines.append(word[:cut])
+            word = word[cut:]
+        cur = word
+    if cur:
+        lines.append(cur)
+    if not lines:
+        return [msg]
+    return [lines[0]] + [indent + l for l in lines[1:]]
+
 
 
 class CopyIdAllocator:
@@ -681,29 +728,32 @@ def output_file_names():
 class ParseStatus:
     """
     Collects everything that happens during a run and writes ParseStatusElements.txt.
-    Same layout as ParseStatusProcess.txt from BTLparser2:
 
+    Standard header (same structure in all status files):
+        CODE=1                    1 | 0 | 2
         RESULT=OK                 OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
-        EXITCODE=1
         TIME=2026-10-01 14:05:12
         BTL=C:\\path\\to\\file.btl
+        TOTAL PARTS=12            all parts in the FileARR files, incl. COUNT copies
+        ERRORS=1
+        WARNINGS=1
+        ERROR: ...                errors first, then warnings; each wrapped to
+          continued text          MESSAGE_WIDTH chars, continuation lines start with 2 spaces
+        WARNING: ...
+
+    Program-specific part:
         MATERIALS=46              materials loaded from fb_MAT_STOCK.txt
         MATOVERRIDES=1            pairs loaded from MAT_SETTINGS.txt
-        TOTAL PARTS=12            all parts in the FileARR files, incl. COUNT copies
-        ERRORS=0
-        WARNINGS=0
 
-        [FileARR1.txt]
-        STATUS=OK                 OK | EMPTY | WRITE_ERROR | NOT_WRITTEN
+        [FileARR.txt]             no-package files first, then FileARR1 ... FileARR25
+        STATUS=WARNING            OK | EMPTY | WARNING | WRITE_ERROR | NOT_WRITTEN
+                                  (WARNING = FileARR/ElemFileARR contain parts without a package)
         PARTS=5                   parts incl. COUNT copies (same as line 1 of the file)
 
-        [ElemFileARR1.txt]
-        STATUS=OK
+        [ElemFileARR.txt]
+        STATUS=WARNING
         PARTS=5
         ...
-        [MESSAGES]
-        ERROR: ...
-        WARNING: ...
     """
 
     def __init__(self, btl_path=""):
@@ -724,26 +774,37 @@ class ParseStatus:
         self.warnings.append(msg)
 
     def add_file(self, name, status, rows):
+        # Parts in the no-package files cannot be processed by CX Supervisor
+        if status == "OK" and name in ("FileARR.txt", "ElemFileARR.txt"):
+            status = "WARNING"
         self.files.append((name, status, rows))
 
     def write(self, result, exit_code, encoding="utf-8"):
         if encoding in (None, "utf-8-sig"):
             encoding = "utf-8"          # no BOM, so line 1 reads exactly "RESULT=..."
+        # --- Standard header (same structure in all status files) ---------
         lines = [
+            "CODE={}".format(exit_code),
             "RESULT={}".format(result),
-            "EXITCODE={}".format(exit_code),
             "TIME={}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             "BTL={}".format(self.btl),
-            "MATERIALS={}".format(self.materials),
-            "MATOVERRIDES={}".format(self.mat_overrides),
             "TOTAL PARTS={}".format(self.total_parts),
-            "ERRORS={}".format(len(self.errors)),
+            #"ERRORS={}".format(len(self.errors)),
             "WARNINGS={}".format(len(self.warnings)),
         ]
-        for name, status, rows in self.files:
+        # Messages directly follow: errors first, then warnings, each word-wrapped
+        for msg in self.errors + self.warnings:
+            lines += wrap_message(msg)
+        # --- Program-specific part -----------------------------------------
+        lines += [
+            "MATERIALS={}".format(self.materials),
+            "MATOVERRIDES={}".format(self.mat_overrides),
+        ]
+        # FileARR / ElemFileARR (no package) first, then the numbered files
+        plain    = [f for f in self.files if f[0] in ("FileARR.txt", "ElemFileARR.txt")]
+        numbered = [f for f in self.files if f[0] not in ("FileARR.txt", "ElemFileARR.txt")]
+        for name, status, rows in plain + numbered:
             lines += ["", "[{}]".format(name), "STATUS={}".format(status), "PARTS={}".format(rows)]
-        if self.errors or self.warnings:
-            lines += ["", "[MESSAGES]"] + self.errors + self.warnings
 
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
