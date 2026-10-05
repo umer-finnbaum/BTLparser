@@ -285,7 +285,7 @@ COUNT_ENABLED = True    # False -> COUNT is ignored (treated as 1), no duplicate
 MESSAGE_WIDTH = 80      # max characters per error/warning line in the status file
 # All five can be overridden by BTLsettings.txt (see load_id_settings).
 
-BTL_SETTINGS_PATH = r"C:\FBtemp\356\BTL\BTLsettings.txt"
+BTL_SETTINGS_PATH = r"C:\FBtemp\356\Configuration\BTLsettings.txt"
 
 
 def load_id_settings(path=None):
