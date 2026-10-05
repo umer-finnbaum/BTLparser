@@ -39,11 +39,13 @@ Process row format:
             Priority ladder — once a higher type is reached it never decreases.
             Only PROCESSKEY values 1-010-1..4 and 2-010-1..4 qualify.
 
-Exit codes: 1 = success, 0 = failure, 2 = bad arguments
+Exit codes: 0 = done, 1 = crash, 10+ = errors (see the BTL parser exit code reference)
 """
 
 import os
 import sys
+import codecs
+import traceback
 import csv
 import datetime
 
@@ -299,7 +301,27 @@ MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
 MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
 COUNT_ENABLED = True    # False -> COUNT is ignored (treated as 1), no duplicate IDs
 MESSAGE_WIDTH = 80      # max characters per error/warning line in the status file
-# All five can be overridden by BTLsettings.txt (see load_id_settings).
+STATUS_ENCODING = "cp1252"  # status file encoding: cp1252 (ANSI, same as Supervisor's
+                            # mapping.txt), utf-8 or utf-8-sig (UTF-8 with BOM)
+# All six can be overridden by BTLsettings.txt (see load_id_settings).
+
+# ---------------------------------------------------------------------------
+# Exit codes (also written as CODE= / RESULT= on lines 1-2 of the status file)
+# Same table in BTLparser and BTLparser2.
+# ---------------------------------------------------------------------------
+RESULT_CODES = {
+    "OK":                 0,   # Done - warnings may still be listed
+    "CRASH":              1,   # unexpected program error (also Python's own crash code)
+    "ARGUMENT_ERROR":    10,   # wrong number of arguments / manual mode without BTL path
+    "BTL_NOT_FOUND":     11,   # BTL file missing or path is not a file
+    "BTL_EMPTY":         12,   # BTL file is 0 bytes
+    "BTL_READ_ERROR":    13,   # BTL file could not be read
+    "NO_DATA":           14,   # BTL read fine, but no parts / processes found
+    "OUTPUT_DIR_ERROR":  15,   # output folder cannot be created
+    "WRITE_ERROR":       16,   # an output file could not be written
+    "MAPPING_NOT_FOUND": 17,   # mapping.txt missing (BTLparser2)
+    "MAPPING_ERROR":     18,   # mapping.txt unreadable / invalid (BTLparser2)
+}
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\Configuration\BTLsettings.txt"
 
@@ -319,7 +341,7 @@ def load_id_settings(path=None):
     Missing file      -> built-in defaults are used (no warning).
     Invalid line/value -> warning printed, that setting keeps its default.
     """
-    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED, MESSAGE_WIDTH
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED, MESSAGE_WIDTH, STATUS_ENCODING
     path = path or BTL_SETTINGS_PATH
 
     if not os.path.isfile(path):
@@ -348,6 +370,15 @@ def load_id_settings(path=None):
                         print("WARNING: BTLsettings line {} ignored (invalid value '{}' for "
                               "COUNT_ENABLED, use 1 or 0).".format(line_num, val), file=sys.stderr)
                     continue
+                if key == "STATUS_ENCODING":
+                    enc = {"ANSI": "cp1252", "WINDOWS-1252": "cp1252"}.get(val.upper(), val.lower())
+                    try:
+                        codecs.lookup(enc)
+                        values[key] = enc
+                    except LookupError:
+                        print("WARNING: BTLsettings line {} ignored (unknown encoding '{}')."
+                              .format(line_num, val), file=sys.stderr)
+                    continue
                 if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID", "MESSAGE_WIDTH"):
                     print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
                           .format(line_num, key), file=sys.stderr)
@@ -371,6 +402,7 @@ def load_id_settings(path=None):
     MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
     COUNT_ENABLED = values.get("COUNT_ENABLED", COUNT_ENABLED)
     MESSAGE_WIDTH = values.get("MESSAGE_WIDTH", MESSAGE_WIDTH)
+    STATUS_ENCODING = values.get("STATUS_ENCODING", STATUS_ENCODING)
     if MESSAGE_WIDTH < 20:
         print("WARNING: MESSAGE_WIDTH ({}) too small, using 20.".format(MESSAGE_WIDTH),
               file=sys.stderr)
@@ -576,8 +608,8 @@ class ParseStatus:
     Collects everything that happens during a run and writes ParseStatusProcess.txt.
 
     Standard header (same structure in all status files):
-        CODE=1                    1 | 0 | 2
-        RESULT=OK                 OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
+        CODE=0                    see RESULT_CODES (0 = done, 1 = crash, 10+ = errors)
+        RESULT=OK                 name from RESULT_CODES
         TIME=2026-10-01 14:05:12
         BTL=Z:\\Saha\\356\\12\\356.btl   manual: the argument; auto: all paths joined with ";"
         TOTAL PARTS=12            unique IDs over all Processes files, incl. COUNT copies
@@ -592,7 +624,7 @@ class ParseStatus:
 
         [Processes1.txt]
         BTL=Z:\\Saha\\356\\12\\356.btl
-        STATUS=OK                 OK | NOT_FOUND | READ_ERROR | WRITE_ERROR | NO_PROCESSES
+        STATUS=OK                 OK | NOT_FOUND | EMPTY | READ_ERROR | WRITE_ERROR | NO_PROCESSES
         IDS=12
         PROCESSROWS=40
         Element,ProjectID,BuildingID,ProcessesFile
@@ -625,21 +657,35 @@ class ParseStatus:
             "mapping_rows": mapping_rows,
         })
 
-    def write(self, result, exit_code, encoding="utf-8"):
+    def finish(self, result):
+        """Write the status file and return the exit code for `result`."""
+        self.write(result)
+        return RESULT_CODES[result]
+
+    def write(self, result, exit_code=None, encoding=None):
+        # CODE comes from RESULT_CODES; encoding is always STATUS_ENCODING
+        # (exit_code / encoding arguments are kept only for compatibility)
+        encoding = STATUS_ENCODING
         # BTL path(s): the manual-mode argument, or every parsed BTL joined with ";"
         btl = self.btl or ";".join(f["btl"] for f in self.files)
         # --- Standard header (same structure in all status files) ---------
         lines = [
-            "CODE={}".format(exit_code),
+            "CODE={}".format(RESULT_CODES[result]),
             "RESULT={}".format(result),
             "TIME={}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             "BTL={}".format(btl),
             "TOTAL PARTS={}".format(sum(f["ids"] for f in self.files)),
-            #"ERRORS={}".format(len(self.errors)),
-            "WARNINGS={}".format(len(self.warnings)),
         ]
-        # Messages directly follow: errors first, then warnings, each word-wrapped
-        for msg in self.errors + self.warnings:
+        # Line 6 + messages from line 7: warnings when the run is done (CODE 0),
+        # otherwise errors only (warnings are not relevant when the run failed)
+        if RESULT_CODES[result] == 0:
+            lines.append("WARNINGS={}".format(len(self.warnings)))
+            messages = self.warnings
+        else:
+            messages = self.errors or [
+                "ERROR: Run ended with RESULT={} (CODE={}).".format(result, RESULT_CODES[result])]
+            lines.append("ERRORS={}".format(len(messages)))
+        for msg in messages:            # each message word-wrapped to MESSAGE_WIDTH
             lines += wrap_message(msg)
         # --- Program-specific part -----------------------------------------
         lines += [
@@ -677,14 +723,7 @@ class ParseStatus:
 
 def main(argv):
     load_id_settings()   # optional BTLsettings.txt overrides
-    # Exit codes:
-    #   1 = success — all Processes files written with rows
-    #   2 = BTL path error or wrong arguments
-    #       (missing/invalid BTL path, wrong number of args, manual mode
-    #        invoked without a BTL path argument)
-    #   0 = no parts/processes produced
-    #       (file found and readable but yielded no usable data,
-    #        or a non-path error such as a write failure)
+    # Exit codes: see RESULT_CODES (0 = done, 1 = crash, 10+ = errors)
 
     status = ParseStatus()
 
@@ -694,8 +733,7 @@ def main(argv):
             "ERROR: Wrong number of arguments ({}). Usage: "
             "btl_process_extractor.exe [<btl_path>]".format(len(argv) - 1)
         )
-        status.write("ARGUMENT_ERROR", 2)
-        return 2
+        return status.finish("ARGUMENT_ERROR")
 
     manual_btl_path = argv[1] if len(argv) == 2 else None
     status.btl = manual_btl_path or ""
@@ -704,27 +742,21 @@ def main(argv):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
     except OSError as e:
         status.error("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e))
-        status.write("ERROR", 0)
-        return 0
+        return status.finish("OUTPUT_DIR_ERROR")
 
     # --- Load mapping -------------------------------------------------------
     try:
         rows, manual_mode, mapping_encoding, mapping_delimiter = load_mapping(MAPPING_PATH)
     except FileNotFoundError as e:
         status.error("ERROR: {}".format(e))
-        status.write("PATH_ERROR", 2)
-        return 2
+        return status.finish("MAPPING_NOT_FOUND")
     except (OSError, ValueError) as e:
         status.error("ERROR: {}".format(e))
-        status.write("ERROR", 0)
-        return 0
+        return status.finish("MAPPING_ERROR")
 
     status.mode = "MANUAL" if manual_mode else "AUTO"
     if not manual_mode:
         status.btl = ""   # paths come from the mapping, listed per file
-    # Same encoding as mapping.txt, so CX Supervisor reads both files the same way
-    # (BOM dropped so line 1 always reads exactly "RESULT=...")
-    status_encoding = "utf-8" if mapping_encoding in (None, "utf-8-sig") else mapping_encoding
 
     # Validate argument consistency
     if manual_mode and manual_btl_path is None:
@@ -732,8 +764,7 @@ def main(argv):
             "ERROR: Mapping has empty ProjectID/BuildingID (manual mode) "
             "but no BTL path was provided as argument."
         )
-        status.write("ARGUMENT_ERROR", 2, status_encoding)
-        return 2
+        return status.finish("ARGUMENT_ERROR")
 
     if not manual_mode and manual_btl_path is not None:
         status.warning(
@@ -796,7 +827,19 @@ def main(argv):
             failed_paths.append(btl_path)
             process_rows = []
             file_status = "NOT_FOUND"
-        except (OSError, ValueError) as e:
+        except ValueError as e:
+            process_rows = []
+            if not os.path.isfile(btl_path):            # path is a folder etc.
+                status.error("ERROR: {}".format(e))
+                failed_paths.append(btl_path)
+                file_status = "NOT_FOUND"
+            elif os.path.getsize(btl_path) == 0:        # 0-byte file
+                status.error("ERROR: {}".format(e))
+                file_status = "EMPTY"
+            else:                                       # readable, but no [PART] entries
+                print("No parts in '{}': {}".format(btl_path, e))
+                file_status = "NO_PROCESSES"
+        except OSError as e:
             status.error("ERROR: {}".format(e))
             process_rows = []
             file_status = "READ_ERROR"
@@ -816,26 +859,48 @@ def main(argv):
         )
 
     # --- Update mapping -----------------------------------------------------
+    mapping_write_failed = False
     try:
         write_mapping(MAPPING_PATH, rows, encoding=mapping_encoding, delimiter=mapping_delimiter)
         print("Mapping updated: {} ({} element(s)).".format(MAPPING_PATH, len(rows)))
     except OSError as e:
         status.error("ERROR: Could not update mapping file: {}".format(e))
+        mapping_write_failed = True
 
     print("Done: {} Processes file(s), {} total process row(s).".format(
         files_written, total_rows))
 
-    # Determine exit code
+    # Determine the result - most serious problem wins
+    file_states = {f["status"] for f in status.files}
     if failed_paths:
-        exit_code, result = 2, "PATH_ERROR"   # at least one BTL path was not found
-    elif total_rows > 0:
-        exit_code, result = 1, "OK"           # all paths OK and processes were produced
+        result = "BTL_NOT_FOUND"     # at least one BTL path was not found
+    elif "READ_ERROR" in file_states:
+        result = "BTL_READ_ERROR"
+    elif "EMPTY" in file_states:
+        result = "BTL_EMPTY"
+    elif "WRITE_ERROR" in file_states or mapping_write_failed:
+        result = "WRITE_ERROR"
+    elif total_rows == 0:
+        result = "NO_DATA"           # all files fine, but no processes extracted
+        status.error("ERROR: No processes found in {} BTL file(s) - no [PART] entries "
+                     "or no PROCESSPARAMETERS lines.".format(len(status.files)))
     else:
-        exit_code, result = 0, "NO_DATA"      # all paths OK but no processes extracted
+        result = "OK"                # done - warnings, if any, are listed
 
-    status.write(result, exit_code, status_encoding)
-    return exit_code
+    return status.finish(result)
+
+
+def run(argv):
+    """Run main(); any unexpected exception becomes CODE=1 / RESULT=CRASH."""
+    try:
+        return main(argv)
+    except Exception as e:
+        traceback.print_exc()
+        crash = ParseStatus()
+        crash.btl = argv[1] if len(argv) > 1 else ""
+        crash.error("ERROR: Unexpected program error: {}: {}".format(type(e).__name__, e))
+        return crash.finish("CRASH")
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(run(sys.argv))

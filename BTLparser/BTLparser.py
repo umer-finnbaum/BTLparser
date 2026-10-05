@@ -68,6 +68,8 @@ Usage
 
 import os
 import sys
+import codecs
+import traceback
 import datetime
 
 # ---------------------------------------------------------------------------
@@ -283,7 +285,27 @@ MAX_ID_VALUE  = 32000   # CX Supervisor integer limit
 MAX_BASE_ID   = 9999    # highest original SINGLEMEMBERNUMBER expected
 COUNT_ENABLED = True    # False -> COUNT is ignored (treated as 1), no duplicate IDs
 MESSAGE_WIDTH = 80      # max characters per error/warning line in the status file
-# All five can be overridden by BTLsettings.txt (see load_id_settings).
+STATUS_ENCODING = "cp1252"  # status file encoding: cp1252 (ANSI, same as Supervisor's
+                            # mapping.txt), utf-8 or utf-8-sig (UTF-8 with BOM)
+# All six can be overridden by BTLsettings.txt (see load_id_settings).
+
+# ---------------------------------------------------------------------------
+# Exit codes (also written as CODE= / RESULT= on lines 1-2 of the status file)
+# Same table in BTLparser and BTLparser2.
+# ---------------------------------------------------------------------------
+RESULT_CODES = {
+    "OK":                 0,   # Done - warnings may still be listed
+    "CRASH":              1,   # unexpected program error (also Python's own crash code)
+    "ARGUMENT_ERROR":    10,   # wrong number of arguments / manual mode without BTL path
+    "BTL_NOT_FOUND":     11,   # BTL file missing or path is not a file
+    "BTL_EMPTY":         12,   # BTL file is 0 bytes
+    "BTL_READ_ERROR":    13,   # BTL file could not be read
+    "NO_DATA":           14,   # BTL read fine, but no parts / processes found
+    "OUTPUT_DIR_ERROR":  15,   # output folder cannot be created
+    "WRITE_ERROR":       16,   # an output file could not be written
+    "MAPPING_NOT_FOUND": 17,   # mapping.txt missing (BTLparser2)
+    "MAPPING_ERROR":     18,   # mapping.txt unreadable / invalid (BTLparser2)
+}
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\Configuration\BTLsettings.txt"
 
@@ -303,7 +325,7 @@ def load_id_settings(path=None):
     Missing file      -> built-in defaults are used (no warning).
     Invalid line/value -> warning printed, that setting keeps its default.
     """
-    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED, MESSAGE_WIDTH
+    global COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID, COUNT_ENABLED, MESSAGE_WIDTH, STATUS_ENCODING
     path = path or BTL_SETTINGS_PATH
 
     if not os.path.isfile(path):
@@ -332,6 +354,15 @@ def load_id_settings(path=None):
                         print("WARNING: BTLsettings line {} ignored (invalid value '{}' for "
                               "COUNT_ENABLED, use 1 or 0).".format(line_num, val), file=sys.stderr)
                     continue
+                if key == "STATUS_ENCODING":
+                    enc = {"ANSI": "cp1252", "WINDOWS-1252": "cp1252"}.get(val.upper(), val.lower())
+                    try:
+                        codecs.lookup(enc)
+                        values[key] = enc
+                    except LookupError:
+                        print("WARNING: BTLsettings line {} ignored (unknown encoding '{}')."
+                              .format(line_num, val), file=sys.stderr)
+                    continue
                 if key not in ("COPY_ID_START", "MAX_ID_VALUE", "MAX_BASE_ID", "MESSAGE_WIDTH"):
                     print("WARNING: BTLsettings line {} ignored (unknown setting '{}')."
                           .format(line_num, key), file=sys.stderr)
@@ -355,6 +386,7 @@ def load_id_settings(path=None):
     MAX_BASE_ID   = values.get("MAX_BASE_ID",   MAX_BASE_ID)
     COUNT_ENABLED = values.get("COUNT_ENABLED", COUNT_ENABLED)
     MESSAGE_WIDTH = values.get("MESSAGE_WIDTH", MESSAGE_WIDTH)
+    STATUS_ENCODING = values.get("STATUS_ENCODING", STATUS_ENCODING)
     if MESSAGE_WIDTH < 20:
         print("WARNING: MESSAGE_WIDTH ({}) too small, using 20.".format(MESSAGE_WIDTH),
               file=sys.stderr)
@@ -730,8 +762,8 @@ class ParseStatus:
     Collects everything that happens during a run and writes ParseStatusElements.txt.
 
     Standard header (same structure in all status files):
-        CODE=1                    1 | 0 | 2
-        RESULT=OK                 OK | PATH_ERROR | ARGUMENT_ERROR | NO_DATA | ERROR
+        CODE=0                    see RESULT_CODES (0 = done, 1 = crash, 10+ = errors)
+        RESULT=OK                 name from RESULT_CODES
         TIME=2026-10-01 14:05:12
         BTL=C:\\path\\to\\file.btl
         TOTAL PARTS=12            all parts in the FileARR files, incl. COUNT copies
@@ -779,21 +811,33 @@ class ParseStatus:
             status = "WARNING"
         self.files.append((name, status, rows))
 
-    def write(self, result, exit_code, encoding="utf-8"):
-        if encoding in (None, "utf-8-sig"):
-            encoding = "utf-8"          # no BOM, so line 1 reads exactly "RESULT=..."
+    def finish(self, result):
+        """Write the status file and return the exit code for `result`."""
+        self.write(result)
+        return RESULT_CODES[result]
+
+    def write(self, result, exit_code=None, encoding=None):
+        # CODE comes from RESULT_CODES; encoding is always STATUS_ENCODING
+        # (exit_code / encoding arguments are kept only for compatibility)
+        encoding = STATUS_ENCODING
         # --- Standard header (same structure in all status files) ---------
         lines = [
-            "CODE={}".format(exit_code),
+            "CODE={}".format(RESULT_CODES[result]),
             "RESULT={}".format(result),
             "TIME={}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             "BTL={}".format(self.btl),
             "TOTAL PARTS={}".format(self.total_parts),
-            #"ERRORS={}".format(len(self.errors)),
-            "WARNINGS={}".format(len(self.warnings)),
         ]
-        # Messages directly follow: errors first, then warnings, each word-wrapped
-        for msg in self.errors + self.warnings:
+        # Line 6 + messages from line 7: warnings when the run is done (CODE 0),
+        # otherwise errors only (warnings are not relevant when the run failed)
+        if RESULT_CODES[result] == 0:
+            lines.append("WARNINGS={}".format(len(self.warnings)))
+            messages = self.warnings
+        else:
+            messages = self.errors or [
+                "ERROR: Run ended with RESULT={} (CODE={}).".format(result, RESULT_CODES[result])]
+            lines.append("ERRORS={}".format(len(messages)))
+        for msg in messages:            # each message word-wrapped to MESSAGE_WIDTH
             lines += wrap_message(msg)
         # --- Program-specific part -----------------------------------------
         lines += [
@@ -855,17 +899,13 @@ def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems,
 
 def main(argv):
     load_id_settings()   # optional BTLsettings.txt overrides
-    # Exit codes match the CX Supervisor VBScript convention:
-    #   0 = failure / empty (ELSEIF exitCode=0 -> "EMPTY")
-    #   1 = success / OK    (IF exitCode=1     -> "OK")
-    #   2 = bad argument    (ELSEIF exitCode=2 -> "Wrong argument / BTL path")
+    # Exit codes: see RESULT_CODES (0 = done, 1 = crash, 10+ = errors)
 
     if len(argv) != 2:
         status = ParseStatus()
         status.error("ERROR: Wrong number of arguments ({}). Usage: BTLparser.exe <input.btl>"
                      .format(len(argv) - 1))
-        status.write("ARGUMENT_ERROR", 2)
-        return 2
+        return status.finish("ARGUMENT_ERROR")
 
     input_path = argv[1]
     status = ParseStatus(input_path)
@@ -873,26 +913,22 @@ def main(argv):
     # --- Input validation ---------------------------------------------------
     if not os.path.exists(input_path):
         status.error("ERROR: BTL file not found: {}".format(input_path))
-        status.write("PATH_ERROR", 2)
-        return 2
+        return status.finish("BTL_NOT_FOUND")
 
     if not os.path.isfile(input_path):
         status.error("ERROR: Path is not a file: {}".format(input_path))
-        status.write("PATH_ERROR", 2)
-        return 2
+        return status.finish("BTL_NOT_FOUND")
 
     if os.path.getsize(input_path) == 0:
         status.error("ERROR: BTL file is empty: {}".format(input_path))
-        status.write("NO_DATA", 0)
-        return 0
+        return status.finish("BTL_EMPTY")
 
     # --- Output directory ---------------------------------------------------
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
     except OSError as e:
         status.error("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e))
-        status.write("ERROR", 0)
-        return 0
+        return status.finish("OUTPUT_DIR_ERROR")
 
     # --- Material stock -----------------------------------------------------
     # Now detect MAT_STOCK encoding and use it when reading so Finnish chars survive.
@@ -922,25 +958,21 @@ def main(argv):
             input_path, mat_lookup, mat_overrides=mat_overrides, encoding=btl_encoding)
     except UnicodeDecodeError as e:
         status.error("ERROR: Could not read BTL file (encoding problem): {}".format(e))
-        status.write("ERROR", 0, btl_encoding)
-        return 0
+        return status.finish("BTL_READ_ERROR")
     except OSError as e:
         status.error("ERROR: Failed to read BTL file: {}".format(e))
-        status.write("ERROR", 0, btl_encoding)
-        return 0
+        return status.finish("BTL_READ_ERROR")
     except Exception as e:
         status.error("ERROR: Unexpected error while parsing BTL: {}".format(e))
-        status.write("ERROR", 0, btl_encoding)
-        return 0
+        return status.finish("BTL_READ_ERROR")
 
     total_numbered = sum(len(v) for v in numbered_buckets.values())
     total_b0       = len(bucket0_rows)
     status.total_parts = total_numbered + total_b0
 
     if total_numbered + total_b0 == 0:
-        status.warning("WARNING: No [PART] entries found in '{}'.".format(input_path))
-        status.write("NO_DATA", 0, btl_encoding)
-        return 0  # Treated as empty/failure by CX Supervisor
+        status.error("ERROR: No [PART] entries found in '{}'.".format(input_path))
+        return status.finish("NO_DATA")
 
     # Parts without a supported package end up in FileARR / ElemFileARR.
     # CX Supervisor cannot process these, so report them as a warning (not an error).
@@ -975,8 +1007,7 @@ def main(argv):
                 status.add_file(name, "NOT_WRITTEN", row_counts[name])
             else:
                 status.add_file(name, "OK" if row_counts[name] else "EMPTY", row_counts[name])
-        status.write("ERROR", 0, btl_encoding)
-        return 0
+        return status.finish("WRITE_ERROR")
 
     for name in output_file_names():
         status.add_file(name, "OK" if row_counts[name] else "EMPTY", row_counts[name])
@@ -991,9 +1022,20 @@ def main(argv):
             print("  FileARR{}: {}".format(bucket, count))
     print("Output written to: {}".format(OUTPUT_DIR))
 
-    status.write("OK", 1, btl_encoding)
-    return 1  # Success
+    return status.finish("OK")   # warnings, if any, are listed in the status file
+
+
+def run(argv):
+    """Run main(); any unexpected exception becomes CODE=1 / RESULT=CRASH."""
+    try:
+        return main(argv)
+    except Exception as e:
+        traceback.print_exc()
+        crash = ParseStatus()
+        crash.btl = argv[1] if len(argv) > 1 else ""
+        crash.error("ERROR: Unexpected program error: {}: {}".format(type(e).__name__, e))
+        return crash.finish("CRASH")
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(run(sys.argv))
