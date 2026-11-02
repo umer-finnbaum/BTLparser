@@ -305,6 +305,8 @@ RESULT_CODES = {
     "WRITE_ERROR":       16,   # an output file could not be written
     "MAPPING_NOT_FOUND": 17,   # mapping.txt missing (BTLparser2)
     "MAPPING_ERROR":     18,   # mapping.txt unreadable / invalid (BTLparser2)
+    "ID_LIMIT_ERROR":    19,   # COUNT copy IDs: ID above MAX_BASE_ID, copy ID above
+                              # MAX_ID_VALUE, or inconsistent ID settings
 }
 
 BTL_SETTINGS_PATH = r"C:\FBtemp\356\Configuration\BTLsettings.txt"
@@ -392,18 +394,28 @@ def load_id_settings(path=None):
               file=sys.stderr)
         MESSAGE_WIDTH = 20
 
-    # Sanity checks - warn only, never stop the run
-    if COPY_ID_START <= MAX_BASE_ID:
-        print("WARNING: COPY_ID_START ({}) must be above MAX_BASE_ID ({}), "
-              "otherwise copy IDs can collide with original IDs."
-              .format(COPY_ID_START, MAX_BASE_ID), file=sys.stderr)
-    if COPY_ID_START > MAX_ID_VALUE:
-        print("WARNING: COPY_ID_START ({}) is above MAX_ID_VALUE ({})."
-              .format(COPY_ID_START, MAX_ID_VALUE), file=sys.stderr)
-
     print("ID settings: COPY_ID_START={}, MAX_ID_VALUE={}, MAX_BASE_ID={}, COUNT_ENABLED={}, "
           "MESSAGE_WIDTH={}".format(COPY_ID_START, MAX_ID_VALUE, MAX_BASE_ID,
                                     "ON" if COUNT_ENABLED else "OFF", MESSAGE_WIDTH))
+
+def validate_id_settings():
+    """
+    Check that the ID settings fit together. Returns a list of ERROR messages
+    (empty when OK). Only relevant while COUNT handling is on.
+      MAX_BASE_ID <= MAX_ID_VALUE
+    COPY_ID_START may lie inside the original ID range: an original ID at or
+    above COPY_ID_START is only a warning when no copies are made, and an
+    error when copies are made (see CopyIdAllocator). Too few copy IDs between
+    COPY_ID_START and MAX_ID_VALUE is also checked per run.
+    """
+    if not COUNT_ENABLED:
+        return []
+    errors = []
+    if MAX_BASE_ID > MAX_ID_VALUE:
+        errors.append("ERROR: ID settings: MAX_BASE_ID ({}) is above MAX_ID_VALUE ({}), "
+                      "original IDs could exceed the ID limit.".format(MAX_BASE_ID, MAX_ID_VALUE))
+    return errors
+
 
 def wrap_message(msg):
     """
@@ -464,30 +476,79 @@ class CopyIdAllocator:
     def __init__(self, start=None, limit=None):
         # Read the module values at call time so BTLsettings.txt overrides apply
         self.next_id = COPY_ID_START if start is None else start
+        self.start   = self.next_id
         self.limit   = MAX_ID_VALUE  if limit is None else limit
-        self._warned_limit = False
+        self.base_ids_too_high = []     # original IDs above MAX_BASE_ID
+        self.base_ids_overlap  = []     # original IDs >= COPY_ID_START (not above MAX_BASE_ID)
 
     def expand(self, base_id, count):
         """Return the list of IDs (as strings) for one part."""
         if not COUNT_ENABLED:
             count = 1   # COUNT handling switched off -> one entry, original ID
-        try:
-            if int(base_id) > MAX_BASE_ID:
-                print("WARNING: ID {} exceeds {} and may collide with copy IDs "
-                      "starting at {}.".format(base_id, MAX_BASE_ID, COPY_ID_START),
-                      file=sys.stderr)
-        except (ValueError, TypeError):
-            pass
+        if COUNT_ENABLED:
+            try:
+                n = int(base_id)
+                if n > MAX_BASE_ID:
+                    if base_id not in self.base_ids_too_high:
+                        self.base_ids_too_high.append(base_id)
+                elif n >= self.start and base_id not in self.base_ids_overlap:
+                    self.base_ids_overlap.append(base_id)
+            except (ValueError, TypeError):
+                pass
 
         ids = [base_id]
         for _ in range(count - 1):
-            if self.next_id > self.limit and not self._warned_limit:
-                print("WARNING: Copy ID {} exceeds the limit of {}."
-                      .format(self.next_id, self.limit), file=sys.stderr)
-                self._warned_limit = True
             ids.append(str(self.next_id))
             self.next_id += 1
         return ids
+
+    @staticmethod
+    def _id_list(ids):
+        """First 10 IDs, plus the total when there are more."""
+        shown = ", ".join(ids[:10])
+        if len(ids) > 10:
+            shown += ", ... ({} in total)".format(len(ids))
+        return shown
+
+    def copies_made(self):
+        return self.next_id - self.start
+
+    def errors(self, source=""):
+        """
+        ERROR messages for this allocator (empty list when all IDs are valid).
+          - original ID above MAX_BASE_ID
+          - original ID at or above COPY_ID_START while copy IDs were generated
+          - more copies than fit between COPY_ID_START and MAX_ID_VALUE
+        """
+        where = " in {}".format(source) if source else ""
+        errors = []
+        if self.base_ids_too_high:
+            errors.append("ERROR: Original ID(s) above MAX_BASE_ID ({}){}: {}."
+                          .format(MAX_BASE_ID, where, self._id_list(self.base_ids_too_high)))
+        used      = self.copies_made()                 # copy IDs handed out
+        available = max(self.limit - self.start + 1, 0)
+        if self.base_ids_overlap and used > 0:
+            errors.append("ERROR: Original ID(s) at or above COPY_ID_START ({}){} overlap the "
+                          "{} copy IDs generated: {}."
+                          .format(self.start, where, used, self._id_list(self.base_ids_overlap)))
+        if used > available:
+            errors.append("ERROR: {} copy IDs needed{}, but only {} fit between "
+                          "COPY_ID_START ({}) and MAX_ID_VALUE ({}). Last copy ID would be {}."
+                          .format(used, where, available, self.start, self.limit,
+                                  self.next_id - 1))
+        return errors
+
+    def warnings(self, source=""):
+        """
+        WARNING messages: original ID(s) at or above COPY_ID_START while no copy
+        IDs were generated - allowed, but they lie inside the copy ID range.
+        """
+        if not self.base_ids_overlap or self.copies_made() > 0:
+            return []
+        where = " in {}".format(source) if source else ""
+        return ["WARNING: Original ID(s) at or above COPY_ID_START ({}){} overlap the copy "
+                "ID range: {}. No copy IDs were generated, so no IDs collide."
+                .format(self.start, where, self._id_list(self.base_ids_overlap))]
 
 
 def make_numbered_row(part):
@@ -598,7 +659,7 @@ def classify_bucket(package_value, module_seen):
 # Main parser
 # ---------------------------------------------------------------------------
 
-def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
+def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_alloc=None):
     """
     Parse the BTL file.
 
@@ -619,7 +680,8 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None):
         encoding = detect_text_encoding(input_path)
 
     numbered_buckets = {b: [] for b in NUMBERED_BUCKETS}
-    id_alloc         = CopyIdAllocator()   # IDs for COUNT > 1 copies
+    if id_alloc is None:
+        id_alloc = CopyIdAllocator()       # IDs for COUNT > 1 copies
     numbered_elems   = {b: [] for b in NUMBERED_BUCKETS}  # parallel: designations only
     bucket0_rows = []
     bucket0_elems = []
@@ -930,6 +992,12 @@ def main(argv):
         status.error("ERROR: Cannot create output directory '{}': {}".format(OUTPUT_DIR, e))
         return status.finish("OUTPUT_DIR_ERROR")
 
+    # --- ID settings (only when COUNT handling is on) -----------------------
+    for msg in validate_id_settings():
+        status.error(msg)
+    if status.errors:
+        return status.finish("ID_LIMIT_ERROR")
+
     # --- Material stock -----------------------------------------------------
     # Now detect MAT_STOCK encoding and use it when reading so Finnish chars survive.
     mat_lookup = load_material_stock(MAT_STOCK_PATH)
@@ -953,9 +1021,11 @@ def main(argv):
         btl_encoding = "utf-8"  # safe default
 
     # --- Parse --------------------------------------------------------------
+    id_alloc = CopyIdAllocator()
     try:
         numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems = parse_btl(
-            input_path, mat_lookup, mat_overrides=mat_overrides, encoding=btl_encoding)
+            input_path, mat_lookup, mat_overrides=mat_overrides, encoding=btl_encoding,
+            id_alloc=id_alloc)
     except UnicodeDecodeError as e:
         status.error("ERROR: Could not read BTL file (encoding problem): {}".format(e))
         return status.finish("BTL_READ_ERROR")
@@ -973,6 +1043,14 @@ def main(argv):
     if total_numbered + total_b0 == 0:
         status.error("ERROR: No [PART] entries found in '{}'.".format(input_path))
         return status.finish("NO_DATA")
+
+    # --- ID limits: original IDs and copy IDs must stay in range ------------
+    for msg in id_alloc.errors():
+        status.error(msg)
+    if status.errors:
+        return status.finish("ID_LIMIT_ERROR")     # no FileARR files written
+    for msg in id_alloc.warnings():
+        status.warning(msg)
 
     # Parts without a supported package end up in FileARR / ElemFileARR.
     # CX Supervisor cannot process these, so report them as a warning (not an error).
