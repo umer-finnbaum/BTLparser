@@ -46,6 +46,10 @@ Cut type is assigned by a priority ladder (typeNum never goes backwards):
   typeNum < 2: angle1!=9000 and angle2==9000  -> CutType "2"
   typeNum < 3: angle1!=9000 and angle2!=9000  -> CutType "3"
 
+Longitudinal cut (PROCESSKEY 4-010-1 .. 4-010-4) -> CutType "4".
+Type 4 has the highest priority: one longitudinal cut anywhere in the part
+makes it Type 4, whatever Types 1-3 the angles would give.
+
 MATERIAL LOOKUP
 ---------------
 The MATERIAL name from the BTL is matched (case-insensitive) against the Name
@@ -96,6 +100,12 @@ NUMBERED_BUCKETS = [1, 2, 3, 4, 8, 12, 13, 18, 20, 21, 22, 25]
 CUT_PROCESS_KEYS = {
     "1-010-1", "1-010-2", "1-010-3", "1-010-4",
     "2-010-1", "2-010-2", "2-010-3", "2-010-4",
+}
+
+# Longitudinal cut ("Length cut" in the BTL COMMENT). Any part with one of these
+# processes gets cut Type 4, which overrides Types 1-3.
+LONG_CUT_PROCESS_KEYS = {
+    "4-010-1", "4-010-2", "4-010-3", "4-010-4",
 }
 
 
@@ -621,6 +631,12 @@ def parse_process_params(tokens):
     return angle1, angle2
 
 
+def mark_longitudinal_cut(part):
+    """Longitudinal cut found: Type 4, highest priority (never lowered again)."""
+    part["cut_type"] = "4"
+    part["type_num"] = 4
+
+
 def update_cut_type(part, angle1, angle2):
     """Apply the priority-ladder cut-type logic to part dict in-place."""
     if angle1 is None or angle2 is None:
@@ -687,6 +703,7 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
     bucket0_elems = []
     current      = None
     process_cut  = False   # True when PROCESSKEY line triggers angle inspection
+    process_long = False   # True when PROCESSKEY is a longitudinal cut (Type 4)
 
     def new_part():
         return {
@@ -743,6 +760,7 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
             flush(current)
             current     = new_part()
             process_cut = False
+            process_long = False
             continue
 
         if current is None:
@@ -791,7 +809,11 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
             current["timber_grade"] = val if val else "0"
 
         elif key == "PROCESSKEY:" and len(tokens) > 1:
-            process_cut = tokens[1] in CUT_PROCESS_KEYS
+            process_cut  = tokens[1] in CUT_PROCESS_KEYS
+            process_long = tokens[1] in LONG_CUT_PROCESS_KEYS
+
+        elif key == "PROCESSPARAMETERS:" and process_long:
+            mark_longitudinal_cut(current)
 
         elif key == "PROCESSPARAMETERS:" and process_cut and len(tokens) > 1:
             a1, a2 = parse_process_params(tokens[1:])

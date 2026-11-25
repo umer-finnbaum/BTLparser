@@ -36,8 +36,10 @@ Process row format:
               1 = both angles 90
               2 = one angle 90, one not
               3 = both angles not 90
+              4 = part has a longitudinal cut (PROCESSKEY 4-010-1..4)
             Priority ladder — once a higher type is reached it never decreases.
-            Only PROCESSKEY values 1-010-1..4 and 2-010-1..4 qualify.
+            Types 1-3: only PROCESSKEY values 1-010-1..4 and 2-010-1..4 qualify.
+            Type 4 has the highest priority and overrides Types 1-3.
 
 Exit codes: 0 = done, 1 = crash, 10+ = errors (see the BTL parser exit code reference)
 """
@@ -71,6 +73,12 @@ NUM_PARAMS = 15
 CUT_PROCESS_KEYS = {
     "1-010-1", "1-010-2", "1-010-3", "1-010-4",
     "2-010-1", "2-010-2", "2-010-3", "2-010-4",
+}
+
+# Longitudinal cut ("Length cut" in the BTL COMMENT). Any part with one of these
+# processes gets cut Type 4, which overrides Types 1-3.
+LONG_CUT_PROCESS_KEYS = {
+    "4-010-1", "4-010-2", "4-010-3", "4-010-4",
 }
 
 
@@ -257,8 +265,12 @@ def compute_cut_type(processes):
     Each process dict has keys "key" (PROCESSKEY str) and "params" ({int: str}).
     P6 = angle1, P7 = angle2, stored as raw BTL integers (9000 = 90 degrees).
 
-    Returns the Type string: "0", "1", "2", or "3".
+    Returns the Type string: "0", "1", "2", "3" or "4".
+    Type 4 (longitudinal cut) has the highest priority and overrides 1-3.
     """
+    if any(proc["key"] in LONG_CUT_PROCESS_KEYS for proc in processes):
+        return "4"
+
     type_num = 0
 
     for proc in processes:
