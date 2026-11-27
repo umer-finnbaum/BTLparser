@@ -13,11 +13,11 @@ ROW FORMAT
 ----------
 Numbered buckets (FileARR1 ... FileARR25):
   PartNum, SingleMemberNum, MaterialNum, Length, Height, Width,
-  ModuleNum, TimberGrade, Designation, CutType
+  ModuleNum, TimberGrade, Designation, CutType, ProcessType
 
 Bucket 0 / FileARR (unclassified package):
   PartNum, SingleMemberNum, MaterialNum, Length, Height, Width,
-  ModuleNum, TimberGrade, Designation, CutType, OriginalPackage
+  ModuleNum, TimberGrade, Designation, CutType, OriginalPackage, ProcessType
 
 PACKAGE -> FileARR bucket mapping
 ----------------------------------
@@ -31,24 +31,26 @@ bucket 22, matching the VBScript behaviour.
 
 CUT TYPE logic
 --------------
-Derived from PROCESSKEY + PROCESSPARAMETERS lines within each part.
-Only the following PROCESSKEY values trigger angle inspection:
-  1-010-1, 1-010-2, 1-010-3, 1-010-4
-  2-010-1, 2-010-2, 2-010-3, 2-010-4
+Derived from each PROCESSKEY and the PROCESSPARAMETERS line after it.
+PROCESSKEY = <group>-<process>-<side>.
 
-From the matching PROCESSPARAMETERS line, tokens starting with 'P' are parsed
-as 'P<index>:<value>' pairs. Index 6 = angle1, index 7 = angle2.
-Angles are integers (9000 = 90.00 degrees in BTL units).
+Cut Type (one value per part): only normal Cuts (1/2-010-X), from P06 / P07
+(9000 = 90.00 degrees). The part gets the highest Cut Type of its Cuts:
+  0 = no normal Cut
+  1 = both angles 90
+  2 = one angle 90, the other 40-140 degrees
+  3 = neither angle 90, both 40-140 degrees
+  4 = one angle 90, the other below 40 or above 140 degrees
+  5 = neither angle 90, one or both below 40 or above 140 degrees
 
-Cut type is assigned by a priority ladder (typeNum never goes backwards):
-  typeNum < 1: angle1==9000 and angle2==9000  -> CutType "1"
-  typeNum < 2: angle1==9000 and angle2!=9000  -> CutType "2"
-  typeNum < 2: angle1!=9000 and angle2==9000  -> CutType "2"
-  typeNum < 3: angle1!=9000 and angle2!=9000  -> CutType "3"
-
-Longitudinal cut (PROCESSKEY 4-010-1 .. 4-010-4) -> CutType "4".
-Type 4 has the highest priority: one longitudinal cut anywhere in the part
-makes it Type 4, whatever Types 1-3 the angles would give.
+Process Type (one value per part, last column of FileARR): the HIGHEST
+priority of all processes in the part, see PROCESS_PRIORITIES:
+  0 = no listed process
+  1 = Marking / Labeling (3/4-060-X)        lowest priority
+  2 = Cut (1/2-010-X)
+  3 = Lap Joint (3/4-030-X)
+  4 = Longitudinal Cut (0/3/4-010-X)
+  5 - 47 = Double Cut ... Variant, in the order of the BTL list of processings
 
 MATERIAL LOOKUP
 ---------------
@@ -97,20 +99,126 @@ PACKAGE_TO_BUCKET = {
 
 NUMBERED_BUCKETS = [1, 2, 3, 4, 8, 12, 13, 18, 20, 21, 22, 25]
 
-CUT_PROCESS_KEYS = {
-    "1-010-1", "1-010-2", "1-010-3", "1-010-4",
-    "2-010-1", "2-010-2", "2-010-3", "2-010-4",
+# ---------------------------------------------------------------------------
+# Cut Type and Process Type (one value each per part)
+# ---------------------------------------------------------------------------
+# PROCESSKEY = <group>-<process>-<side>, e.g. 1-010-2 = group 1, process 010.
+#
+# Cut Type: only normal Cuts (1/2-010-X), from P06 and P07 (1/100 degree).
+# The part gets the highest Cut Type of its normal Cuts (0 = none):
+#   1 = both angles 90
+#   2 = one angle 90, the other between 40 and 140 degrees
+#   3 = neither angle 90, both between 40 and 140 degrees
+#   4 = one angle 90, the other below 40 or above 140 degrees
+#   5 = neither angle 90, one or both below 40 or above 140 degrees
+ANGLE_90       = 9000    # 90.00 degrees
+ANGLE_STEEP_LO = 4000    # below 40.00 degrees  -> steep (Type 4 / 5)
+ANGLE_STEEP_HI = 14000   # above 140.00 degrees -> steep (Type 4 / 5)
+
+# Process Type: priority of each process, lowest first. The part gets the
+# HIGHEST priority number of all its processes (0 = no listed process).
+# (groups, process number, priority, name); after Lap Joint the order is the
+# BTL "List of processings".
+PROCESS_PRIORITIES = [
+    ("3/4",       "060",  1, "Marking / Labeling"),
+    ("1/2",       "010",  2, "Cut"),
+    ("3/4",       "030",  3, "Lap Joint"),
+    ("0/3/4",     "010",  4, "Longitudinal Cut"),
+    ("1/2",       "011",  5, "Double Cut"),
+    ("0",         "012",  6, "Ridge or Valley Cut"),
+    ("0/3/4",     "013",  7, "Saw Cut"),
+    ("3/4",       "016",  8, "Slot"),
+    ("3/4",       "017",  9, "Front Slot"),
+    ("3/4",       "020", 10, "Birds Mouth"),
+    ("3/4",       "025", 11, "Hip or Valley Rafter Notch"),
+    ("1/2",       "030", 12, "Ridge Lap"),
+    ("3/4",       "032", 13, "Notch / Rabbet"),
+    ("3/4",       "033", 14, "Block House Half Lap, Stair Riser Dado"),
+    ("3/4",       "034", 15, "Seathing Cut"),
+    ("1/2",       "035", 16, "French Ridge Lap"),
+    ("3/4",       "036", 17, "Chamfer"),
+    ("4",         "037", 18, "Block House Half Lap"),
+    ("3/4",       "038", 19, "Block House Front"),
+    ("4",         "039", 20, "Pocket"),
+    ("3/4",       "040", 21, "Drilling"),
+    ("1/2",       "050", 22, "Tenon"),
+    ("3/4",       "050", 23, "Mortise"),
+    ("3/4",       "051", 24, "Mortise Front"),
+    ("3/4",       "052", 25, "House"),
+    ("3/4",       "053", 26, "House Mortise"),
+    ("1/2",       "055", 27, "Dovetail Tenon"),
+    ("3/4",       "055", 28, "Dovetail Mortise"),
+    ("3/4",       "056", 29, "Dovetail Mortise Front"),
+    ("4",         "061", 30, "Text"),
+    ("1/2",       "070", 31, "Simple Scarf"),
+    ("1/2",       "071", 32, "Scarf Joint"),
+    ("1/2",       "080", 33, "Step Joint"),
+    ("3/4",       "080", 34, "Step Joint Notch"),
+    ("3/4",       "090", 35, "Planing"),
+    ("3/4",       "100", 36, "Profile Front"),
+    ("3/4",       "101", 37, "Profile Head concave"),
+    ("3/4",       "102", 38, "Profile Head convex"),
+    ("3/4",       "103", 39, "Profile Head cambered"),
+    ("4",         "104", 40, "Round Arch"),
+    ("3/4",       "106", 41, "Profile Head"),
+    ("3/4",       "107", 42, "Sphere"),
+    ("4",         "120", 43, "Triangle Cut"),
+    ("1/2/3/4",   "136", 44, "Tyrolean Dovetail"),
+    ("1/2/3/4",   "138", 45, "Dovetail"),
+    ("0/3/4",     "250", 46, "Free Contour"),
+    ("0/1/2/3/4", "900", 47, "Variant"),
+]
+
+# (group, process) -> priority, built once from the table above
+PROCESS_PRIORITY_LOOKUP = {
+    (group, process): priority
+    for groups, process, priority, _name in PROCESS_PRIORITIES
+    for group in groups.split("/")
 }
 
-# Longitudinal cut ("Length cut" in the BTL COMMENT). Any part with one of these
-# processes gets cut Type 4, which overrides Types 1-3.
-LONG_CUT_PROCESS_KEYS = {
-    "4-010-1", "4-010-2", "4-010-3", "4-010-4",
-}
+
+def _split_key(process_key):
+    """'1-010-2' -> ('1', '010'); malformed -> (None, None)."""
+    parts = process_key.split("-")
+    if len(parts) < 2:
+        return None, None
+    return parts[0], parts[1]
+
+
+def cut_type_from_angles(angle1, angle2):
+    """Cut Type 1-5 for a normal Cut from P06 / P07 (None = angle missing -> 0)."""
+    if angle1 is None or angle2 is None:
+        return 0
+
+    def steep(a):
+        return a < ANGLE_STEEP_LO or a > ANGLE_STEEP_HI
+
+    if angle1 == ANGLE_90 and angle2 == ANGLE_90:
+        return 1
+    if angle1 == ANGLE_90 or angle2 == ANGLE_90:
+        other = angle2 if angle1 == ANGLE_90 else angle1
+        return 4 if steep(other) else 2
+    return 5 if steep(angle1) or steep(angle2) else 3
+
+
+def process_cut_type(process_key, angle1=None, angle2=None):
+    """Cut Type for one process: 1-5 for a normal Cut, 0 for anything else."""
+    group, process = _split_key(process_key)
+    if group in ("1", "2") and process == "010":
+        return cut_type_from_angles(angle1, angle2)
+    return 0
+
+
+def process_priority(process_key):
+    """Process Type (priority) for one process, 0 = not in PROCESS_PRIORITIES."""
+    group, process = _split_key(process_key)
+    return PROCESS_PRIORITY_LOOKUP.get((group, process), 0)
 
 
 # Header written as line 2 of every output file (line 1 is the part count).
-FILE_HEADER = "PartNum,ID,MaterialType,Length,Heigth,Width,ModuleNum,Timbergrade,ElemName,Type"
+FILE_HEADER = "PartNum,ID,MaterialType,Length,Heigth,Width,ModuleNum,Timbergrade,ElemName,Type,ProcessType"
+# FileARR.txt (parts without a supported PACKAGE) has the package before ProcessType
+FILE_HEADER_BUCKET0 = "PartNum,ID,MaterialType,Length,Heigth,Width,ModuleNum,Timbergrade,ElemName,Type,OriginalPackage,ProcessType"
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +686,8 @@ def make_numbered_row(part):
         part.get("module_num",   "0"),    # MODULENUMBER (part after "-")
         part.get("timber_grade", "0"),    # TIMBERGRADE
         part.get("designation",  ""),     # DESIGNATION
-        part.get("cut_type",     "0"),    # derived from PROCESSKEY/PROCESSPARAMETERS
+        part.get("cut_type",     "0"),    # normal Cuts only, from P06/P07
+        part.get("process_type", "0"),    # highest process priority
     ])
 
 
@@ -599,6 +708,7 @@ def make_bucket0_row(part):
         part.get("designation",  ""),
         part.get("cut_type",     "0"),
         part.get("package",      ""),     # Dfield[4] — original PACKAGE value
+        part.get("process_type", "0"),    # highest process priority
     ])
 
 
@@ -631,29 +741,18 @@ def parse_process_params(tokens):
     return angle1, angle2
 
 
-def mark_longitudinal_cut(part):
-    """Longitudinal cut found: Type 4, highest priority (never lowered again)."""
-    part["cut_type"] = "4"
-    part["type_num"] = 4
+def update_cut_type(part, cut_type):
+    """Keep the highest Cut Type seen in the part (it never goes down)."""
+    if cut_type > part.get("type_num", 0):
+        part["type_num"] = cut_type
+        part["cut_type"] = str(cut_type)
 
 
-def update_cut_type(part, angle1, angle2):
-    """Apply the priority-ladder cut-type logic to part dict in-place."""
-    if angle1 is None or angle2 is None:
-        return
-    type_num = part.get("type_num", 0)
-    if angle1 == 9000 and angle2 == 9000 and type_num < 1:
-        part["cut_type"] = "1"
-        part["type_num"] = 1
-    elif angle1 == 9000 and angle2 != 9000 and type_num < 2:
-        part["cut_type"] = "2"
-        part["type_num"] = 2
-    elif angle1 != 9000 and angle2 == 9000 and type_num < 2:
-        part["cut_type"] = "2"
-        part["type_num"] = 2
-    elif angle1 != 9000 and angle2 != 9000 and type_num < 3:
-        part["cut_type"] = "3"
-        part["type_num"] = 3
+def update_process_type(part, priority):
+    """Keep the highest process priority seen in the part (it never goes down)."""
+    if priority > part.get("process_num", 0):
+        part["process_num"]  = priority
+        part["process_type"] = str(priority)
 
 
 # ---------------------------------------------------------------------------
@@ -702,8 +801,7 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
     bucket0_rows = []
     bucket0_elems = []
     current      = None
-    process_cut  = False   # True when PROCESSKEY line triggers angle inspection
-    process_long = False   # True when PROCESSKEY is a longitudinal cut (Type 4)
+    pending_key  = ""      # PROCESSKEY waiting for its PROCESSPARAMETERS line
 
     def new_part():
         return {
@@ -720,6 +818,8 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
             "timber_grade":  "0",
             "cut_type":      "0",
             "type_num":      0,
+            "process_type":  "0",
+            "process_num":   0,
             "module_seen":   False,
         }
 
@@ -759,8 +859,7 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
         if key == "[PART]":
             flush(current)
             current     = new_part()
-            process_cut = False
-            process_long = False
+            pending_key = ""
             continue
 
         if current is None:
@@ -809,15 +908,13 @@ def parse_btl(input_path, mat_lookup, mat_overrides=None, encoding=None, id_allo
             current["timber_grade"] = val if val else "0"
 
         elif key == "PROCESSKEY:" and len(tokens) > 1:
-            process_cut  = tokens[1] in CUT_PROCESS_KEYS
-            process_long = tokens[1] in LONG_CUT_PROCESS_KEYS
+            pending_key = tokens[1]
 
-        elif key == "PROCESSPARAMETERS:" and process_long:
-            mark_longitudinal_cut(current)
-
-        elif key == "PROCESSPARAMETERS:" and process_cut and len(tokens) > 1:
+        elif key == "PROCESSPARAMETERS:" and pending_key:
             a1, a2 = parse_process_params(tokens[1:])
-            update_cut_type(current, a1, a2)
+            update_cut_type(current, process_cut_type(pending_key, a1, a2))
+            update_process_type(current, process_priority(pending_key))
+            pending_key = ""
 
     # Flush the final part (no trailing [PART] to trigger it inside the loop).
     flush(current)
@@ -949,13 +1046,13 @@ def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems,
     """Write all output files with Windows CRLF line endings using the given encoding."""
     os.makedirs(output_dir, exist_ok=True)
 
-    def write_file(path, rows, header=True):
-        """Write count, optional header, then one row per line."""
+    def write_file(path, rows, header=FILE_HEADER):
+        """Write count, optional header line, then one row per line."""
         with open(path, "w", encoding=encoding, newline="") as f:
             f.write(str(len(rows)))
             f.write("\r\n")
             if header:
-                f.write(FILE_HEADER)
+                f.write(header)
                 f.write("\r\n")
             for row in rows:
                 f.write(row)
@@ -967,14 +1064,14 @@ def write_outputs(numbered_buckets, numbered_elems, bucket0_rows, bucket0_elems,
         elems = numbered_elems.get(bucket, [])
         try:
             write_file(os.path.join(output_dir, "FileARR{}.txt".format(bucket)), rows)
-            write_file(os.path.join(output_dir, "ElemFileARR{}.txt".format(bucket)), elems, header=False)
+            write_file(os.path.join(output_dir, "ElemFileARR{}.txt".format(bucket)), elems, header=None)
         except OSError as e:
             # Bubble the exception up to caller for consistent handling
             raise
 
     # Bucket 0 — FileARR and ElemFileARR (unclassified parts)
-    write_file(os.path.join(output_dir, "FileARR.txt"),     bucket0_rows)
-    write_file(os.path.join(output_dir, "ElemFileARR.txt"), bucket0_elems, header=False)
+    write_file(os.path.join(output_dir, "FileARR.txt"),     bucket0_rows, header=FILE_HEADER_BUCKET0)
+    write_file(os.path.join(output_dir, "ElemFileARR.txt"), bucket0_elems, header=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,7 +1174,7 @@ def main(argv):
     # Parts without a supported package end up in FileARR / ElemFileARR.
     # CX Supervisor cannot process these, so report them as a warning (not an error).
     if bucket0_rows:
-        packages = sorted({row.rsplit(",", 1)[-1] or "(empty)" for row in bucket0_rows})
+        packages = sorted({row.rsplit(",", 2)[-2] or "(empty)" for row in bucket0_rows})
         status.warning(
             "WARNING: {} part(s) without a supported PACKAGE written to FileARR.txt / "
             "ElemFileARR.txt (PACKAGE: {}).".format(len(bucket0_rows), ", ".join(packages))

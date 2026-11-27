@@ -31,15 +31,15 @@ Process row format:
 
   P1-P14  : numeric, divided by 100
   P15     : string (quotes stripped)
-  Type    : cut-angle classification per part (same logic as btl_parser):
-              0 = no qualifying PROCESSKEY found
+  Type    : Cut Type per part, same logic as BTLparser.
+            Cut Type (one value per part): only normal Cuts (1/2-010-X), from P06 / P07
+            (9000 = 90.00 degrees). The part gets the highest Cut Type of its Cuts:
+              0 = no normal Cut
               1 = both angles 90
-              2 = one angle 90, one not
-              3 = both angles not 90
-              4 = part has a longitudinal cut (PROCESSKEY 4-010-1..4)
-            Priority ladder — once a higher type is reached it never decreases.
-            Types 1-3: only PROCESSKEY values 1-010-1..4 and 2-010-1..4 qualify.
-            Type 4 has the highest priority and overrides Types 1-3.
+              2 = one angle 90, the other 40-140 degrees
+              3 = neither angle 90, both 40-140 degrees
+              4 = one angle 90, the other below 40 or above 140 degrees
+              5 = neither angle 90, one or both below 40 or above 140 degrees
 
 Exit codes: 0 = done, 1 = crash, 10+ = errors (see the BTL parser exit code reference)
 """
@@ -70,16 +70,120 @@ MAPPING_HEADER = "Element,ProjectID,BuildingID,ProcessesFile"
 
 NUM_PARAMS = 15
 
-CUT_PROCESS_KEYS = {
-    "1-010-1", "1-010-2", "1-010-3", "1-010-4",
-    "2-010-1", "2-010-2", "2-010-3", "2-010-4",
+# ---------------------------------------------------------------------------
+# Cut Type and Process Type (one value each per part)
+# ---------------------------------------------------------------------------
+# PROCESSKEY = <group>-<process>-<side>, e.g. 1-010-2 = group 1, process 010.
+#
+# Cut Type: only normal Cuts (1/2-010-X), from P06 and P07 (1/100 degree).
+# The part gets the highest Cut Type of its normal Cuts (0 = none):
+#   1 = both angles 90
+#   2 = one angle 90, the other between 40 and 140 degrees
+#   3 = neither angle 90, both between 40 and 140 degrees
+#   4 = one angle 90, the other below 40 or above 140 degrees
+#   5 = neither angle 90, one or both below 40 or above 140 degrees
+ANGLE_90       = 9000    # 90.00 degrees
+ANGLE_STEEP_LO = 4000    # below 40.00 degrees  -> steep (Type 4 / 5)
+ANGLE_STEEP_HI = 14000   # above 140.00 degrees -> steep (Type 4 / 5)
+
+# Process Type: priority of each process, lowest first. The part gets the
+# HIGHEST priority number of all its processes (0 = no listed process).
+# (groups, process number, priority, name); after Lap Joint the order is the
+# BTL "List of processings".
+PROCESS_PRIORITIES = [
+    ("3/4",       "060",  1, "Marking / Labeling"),
+    ("1/2",       "010",  2, "Cut"),
+    ("3/4",       "030",  3, "Lap Joint"),
+    ("0/3/4",     "010",  4, "Longitudinal Cut"),
+    ("1/2",       "011",  5, "Double Cut"),
+    ("0",         "012",  6, "Ridge or Valley Cut"),
+    ("0/3/4",     "013",  7, "Saw Cut"),
+    ("3/4",       "016",  8, "Slot"),
+    ("3/4",       "017",  9, "Front Slot"),
+    ("3/4",       "020", 10, "Birds Mouth"),
+    ("3/4",       "025", 11, "Hip or Valley Rafter Notch"),
+    ("1/2",       "030", 12, "Ridge Lap"),
+    ("3/4",       "032", 13, "Notch / Rabbet"),
+    ("3/4",       "033", 14, "Block House Half Lap, Stair Riser Dado"),
+    ("3/4",       "034", 15, "Seathing Cut"),
+    ("1/2",       "035", 16, "French Ridge Lap"),
+    ("3/4",       "036", 17, "Chamfer"),
+    ("4",         "037", 18, "Block House Half Lap"),
+    ("3/4",       "038", 19, "Block House Front"),
+    ("4",         "039", 20, "Pocket"),
+    ("3/4",       "040", 21, "Drilling"),
+    ("1/2",       "050", 22, "Tenon"),
+    ("3/4",       "050", 23, "Mortise"),
+    ("3/4",       "051", 24, "Mortise Front"),
+    ("3/4",       "052", 25, "House"),
+    ("3/4",       "053", 26, "House Mortise"),
+    ("1/2",       "055", 27, "Dovetail Tenon"),
+    ("3/4",       "055", 28, "Dovetail Mortise"),
+    ("3/4",       "056", 29, "Dovetail Mortise Front"),
+    ("4",         "061", 30, "Text"),
+    ("1/2",       "070", 31, "Simple Scarf"),
+    ("1/2",       "071", 32, "Scarf Joint"),
+    ("1/2",       "080", 33, "Step Joint"),
+    ("3/4",       "080", 34, "Step Joint Notch"),
+    ("3/4",       "090", 35, "Planing"),
+    ("3/4",       "100", 36, "Profile Front"),
+    ("3/4",       "101", 37, "Profile Head concave"),
+    ("3/4",       "102", 38, "Profile Head convex"),
+    ("3/4",       "103", 39, "Profile Head cambered"),
+    ("4",         "104", 40, "Round Arch"),
+    ("3/4",       "106", 41, "Profile Head"),
+    ("3/4",       "107", 42, "Sphere"),
+    ("4",         "120", 43, "Triangle Cut"),
+    ("1/2/3/4",   "136", 44, "Tyrolean Dovetail"),
+    ("1/2/3/4",   "138", 45, "Dovetail"),
+    ("0/3/4",     "250", 46, "Free Contour"),
+    ("0/1/2/3/4", "900", 47, "Variant"),
+]
+
+# (group, process) -> priority, built once from the table above
+PROCESS_PRIORITY_LOOKUP = {
+    (group, process): priority
+    for groups, process, priority, _name in PROCESS_PRIORITIES
+    for group in groups.split("/")
 }
 
-# Longitudinal cut ("Length cut" in the BTL COMMENT). Any part with one of these
-# processes gets cut Type 4, which overrides Types 1-3.
-LONG_CUT_PROCESS_KEYS = {
-    "4-010-1", "4-010-2", "4-010-3", "4-010-4",
-}
+
+def _split_key(process_key):
+    """'1-010-2' -> ('1', '010'); malformed -> (None, None)."""
+    parts = process_key.split("-")
+    if len(parts) < 2:
+        return None, None
+    return parts[0], parts[1]
+
+
+def cut_type_from_angles(angle1, angle2):
+    """Cut Type 1-5 for a normal Cut from P06 / P07 (None = angle missing -> 0)."""
+    if angle1 is None or angle2 is None:
+        return 0
+
+    def steep(a):
+        return a < ANGLE_STEEP_LO or a > ANGLE_STEEP_HI
+
+    if angle1 == ANGLE_90 and angle2 == ANGLE_90:
+        return 1
+    if angle1 == ANGLE_90 or angle2 == ANGLE_90:
+        other = angle2 if angle1 == ANGLE_90 else angle1
+        return 4 if steep(other) else 2
+    return 5 if steep(angle1) or steep(angle2) else 3
+
+
+def process_cut_type(process_key, angle1=None, angle2=None):
+    """Cut Type for one process: 1-5 for a normal Cut, 0 for anything else."""
+    group, process = _split_key(process_key)
+    if group in ("1", "2") and process == "010":
+        return cut_type_from_angles(angle1, angle2)
+    return 0
+
+
+def process_priority(process_key):
+    """Process Type (priority) for one process, 0 = not in PROCESS_PRIORITIES."""
+    group, process = _split_key(process_key)
+    return PROCESS_PRIORITY_LOOKUP.get((group, process), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -265,34 +369,20 @@ def compute_cut_type(processes):
     Each process dict has keys "key" (PROCESSKEY str) and "params" ({int: str}).
     P6 = angle1, P7 = angle2, stored as raw BTL integers (9000 = 90 degrees).
 
-    Returns the Type string: "0", "1", "2", "3" or "4".
-    Type 4 (longitudinal cut) has the highest priority and overrides 1-3.
+    Returns the highest Cut Type of the part's normal Cuts, as a string
+    (see cut_type_from_angles; other processes give 0).
     """
-    if any(proc["key"] in LONG_CUT_PROCESS_KEYS for proc in processes):
-        return "4"
-
-    type_num = 0
-
-    for proc in processes:
-        if proc["key"] not in CUT_PROCESS_KEYS:
-            continue
-
+    def angle(raw):
         try:
-            angle1 = int(proc["params"].get(6, "0"))
-            angle2 = int(proc["params"].get(7, "0"))
-        except ValueError:
-            continue
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return None     # missing angle -> that Cut gives no Type
 
-        if angle1 == 9000 and angle2 == 9000 and type_num < 1:
-            type_num = 1
-        elif angle1 == 9000 and angle2 != 9000 and type_num < 2:
-            type_num = 2
-        elif angle1 != 9000 and angle2 == 9000 and type_num < 2:
-            type_num = 2
-        elif angle1 != 9000 and angle2 != 9000 and type_num < 3:
-            type_num = 3
-
-    return str(type_num)
+    best = 0
+    for proc in processes:
+        params = proc["params"]
+        best = max(best, process_cut_type(proc["key"], angle(params.get(6)), angle(params.get(7))))
+    return str(best)
 
 
 # ---------------------------------------------------------------------------
